@@ -8,10 +8,12 @@ from utils.spectogram import plot_spectrogram
 from utils.models_flattening_separate import CustomFlatteningSeparateCodebookLM
 from utils.models_gpt2 import CustomGPT2ForConditionalGeneration
 from utils.models_delay import RVQDelayTransformerLM
+from utils.models_flattening_separate_curriculum import  CurriculumFlatteningSeparateLM
 from transformers import GPT2Tokenizer
-from utils.patterns import StackDelayPatternProvider
 import numpy as np
 from torch.utils.data import Subset
+
+
 
 BASE_AUDIO_VOCAB_SIZE = 1024
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -60,14 +62,14 @@ class EvalAudioLoggerCallback(TrainerCallback):
         elif isinstance(model, RVQDelayTransformerLM):
             vocal_context = batch["vocal_context"].to(self.device)
 
-        positional_embedding = batch["positional_embedding"].to(self.device)
+        #positional_embedding = batch["positional_embedding"].to(self.device)
         instrument_token    = batch["instrument_token"].to(self.device)
         labels = batch["labels"].to(self.device)
         batch_size = labels.size(0)
 
         # Get predictions
         with torch.no_grad():
-            if isinstance(model, CustomFlatteningSeparateCodebookLM):
+            if isinstance(model, (CustomFlatteningSeparateCodebookLM,  CurriculumFlatteningSeparateLM)):
                 vocal_context        = batch["vocal_context"].to(self.device)
                 instrument_token     = batch["instrument_token"].to(self.device)
                 positional_embedding = batch["positional_embedding"].to(self.device)
@@ -82,6 +84,15 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     do_sample=False,
                 ).to(self.device)   # [B, max_len]
                 C = self.codebook_count
+                preds_top_k = model.generate(
+                    vocal_context=vocal_context,
+                    instrument_token=instrument_token,
+                    positional_embedding=positional_embedding,
+                    max_length=model.max_length,
+                    do_sample=True,
+                    top_k=50,
+                    temperature=0.8
+                ).to(self.device)
             elif isinstance(model, CustomGPT2ForConditionalGeneration):
                 preds = model.generate(
                     input_ids=vocal_context,
@@ -104,6 +115,15 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     positional_embedding=positional_embedding,
                     max_length=model.max_length,
                 ).to(self.device)
+                preds_top_k = model.generate(
+                    vocal_context=vocal_context,
+                    instrument_token=instrument_token,
+                    positional_embedding=positional_embedding,
+                    max_length=model.max_length,
+                    do_sample=True,
+                    top_k=50,
+                    temperature=1.0
+                ).to(self.device)
             else:
                 logits = model(
                     input_ids=vocal_context,
@@ -115,7 +135,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
         # 1) Log ground-truth labels once
         if not self.reference_logged:
             for i in range(min(self.samples_to_log, batch_size)):
-                if isinstance(model, CustomFlatteningSeparateCodebookLM):
+                if isinstance(model, (CustomFlatteningSeparateCodebookLM, CurriculumFlatteningSeparateLM)):
                     flat_labels = labels[i].cpu()  # shape: (C * L,)
                     C = self.codebook_count
                     L = self.codebook_length
@@ -147,9 +167,8 @@ class EvalAudioLoggerCallback(TrainerCallback):
                         audio_label,
                         sample_rate=self.processor.sampling_rate,
                         caption=f"Ground-truth sample {i}"
-                    ),
-                    "step": state.global_step
-                })
+                    ), "step": state.global_step},
+                )
             self.reference_logged = True
         if isinstance(model, CustomGPT2ForConditionalGeneration):
             batch_size, total_len = preds.shape
@@ -159,12 +178,25 @@ class EvalAudioLoggerCallback(TrainerCallback):
         # 2) Always log mixed audio *and* pred spectrogram
         for i in range(min(self.samples_to_log, batch_size)):
             # --- predicted audio ---
-            if isinstance(model, CustomFlatteningSeparateCodebookLM):
+            if isinstance(model, (CustomFlatteningSeparateCodebookLM, CurriculumFlatteningSeparateLM)):
                 flat_preds = preds[i].cpu()  # shape: (C * L,)
                 C = self.codebook_count
                 L = self.codebook_length
                 pred_seq = torch.stack([ flat_preds[j::C] for j in range(C) ], dim=0)
                 pred_seq = pred_seq % BASE_AUDIO_VOCAB_SIZE
+
+                flat_preds_top_k = preds_top_k[i].cpu()  # shape: (C * L,)
+                pred_seq_top_k = torch.stack([ flat_preds_top_k[j::C] for j in range(C) ], dim=0)
+                pred_seq_top_k = pred_seq_top_k % BASE_AUDIO_VOCAB_SIZE
+                codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
+                audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
+                .cpu().squeeze().detach().numpy()
+                wandb.log({
+                    f"pred_top_k/sample_{i}": wandb.Audio(
+                        audio_pred_top_k,
+                        sample_rate=self.processor.sampling_rate,
+                        caption=f"Pred Top K #{i}"
+                    ), "step": state.global_step})
             elif isinstance(model, RVQDelayTransformerLM):
                 seq_preds = preds[i].unsqueeze(0)  # [1, K, S]
                 orig_preds, _, mask = pattern.revert_pattern_sequence(seq_preds, special_token=1024)
@@ -173,6 +205,23 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 # 4) Keep only those columns: [K, T_real]
                 codes_real = orig_preds[0, :, valid]
                 pred_seq = codes_real.squeeze(0).to(self.device)
+
+                seq_preds_top_k = preds_top_k[i].unsqueeze(0)  # [1, K, S]
+                orig_preds_top_k, _, mask = pattern.revert_pattern_sequence(seq_preds_top_k, special_token=1024)
+                valid = mask.any(dim=0)            # → [T]
+
+                # 4) Keep only those columns: [K, T_real]
+                codes_real_top_k = orig_preds_top_k[0, :, valid]
+                pred_seq_top_k = codes_real_top_k.squeeze(0).to(self.device)
+                codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
+                audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
+                .cpu().squeeze().detach().numpy()
+                wandb.log({
+                    f"pred_top_k/sample_{i}": wandb.Audio(
+                        audio_pred_top_k,
+                        sample_rate=self.processor.sampling_rate,
+                        caption=f"Pred Top K #{i}"
+                    ), "step": state.global_step})
             else:
                 pred_seq = preds[i].cpu().view(self.codebook_count, self.codebook_length)
             codes_pred = pred_seq.unsqueeze(0).unsqueeze(0).to(self.device)
@@ -190,7 +239,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 f"pred_audio/sample_{i}": wandb.Audio(
                     audio_pred,
                     sample_rate=self.processor.sampling_rate,
-                    caption=f"Predicted audio {i}"
+                    caption=f"Predicted audio Greedy {i}"
                 ),
                 f"pred_spectrogram/sample_{i}": wandb.Image(
                     plot_spectrogram(
@@ -201,15 +250,14 @@ class EvalAudioLoggerCallback(TrainerCallback):
                         n_mels=128,
                         top_db=None
                     ).gcf()
-                ),
-                "step": state.global_step
+                ), "step": state.global_step
             })
             plt.close('all')
 
             # --- vocal audio ---
             if isinstance(model, CustomGPT2ForConditionalGeneration):
                 v_seq = vocal_context[i].cpu().view(self.codebook_count, self.codebook_length)
-            if isinstance(model, CustomFlatteningSeparateCodebookLM):
+            if isinstance(model, (CustomFlatteningSeparateCodebookLM, CurriculumFlatteningSeparateLM)):
                 flat_voc = vocal_context[i].cpu()
                 v_seq = torch.stack([ flat_voc[j::C] for j in range(C) ], dim=0)
                 v_seq = v_seq % BASE_AUDIO_VOCAB_SIZE
@@ -231,9 +279,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     audio_mix,
                     sample_rate=self.processor.sampling_rate,
                     caption=f"Pred+Vocal mix #{i}"
-                ),
-                "step": state.global_step
+                ), "step": state.global_step
             })
             plt.close('all')
-
 

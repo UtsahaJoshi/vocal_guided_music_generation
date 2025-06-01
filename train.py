@@ -15,11 +15,19 @@ from utils.patterns import StackDelayPatternProvider
 
 # Import model initialization helpers from our utility module.
 from utils.models import init_flattening_model, init_flattening_separate_model, init_gpt2_model, init_delay_model
+from utils.models_flattening_separate_curriculum import CurriculumFlatteningSeparateLM
+from utils.curriculum_schedular import CurriculumScheduler
+
+
 from utils.load_npz_with_index import load_npz_with_index
 from utils.wandb_callbacks import LrLoggerCallback, EvalAudioLoggerCallback
 
+
 if (torch.cuda.is_available()):
     torch.backends.cuda.sdp_kernel = "flash"
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True    
 
 # -------------------------------
 # Device Setup
@@ -42,7 +50,7 @@ parser.add_argument(
     help="Instrument classes to include in training"
 )
 parser.add_argument("--model_type", type=str, default="flattening_shared",
-                    choices=["flattening_shared", "flattening_separate", "gpt2", "delay"],
+                    choices=["flattening_shared", "flattening_separate", "flattening_separate_curriculum", "gpt2", "delay"],
                     help="Choose the model to train: 'flattening_shared', 'flattening_separate', 'gpt2', or 'delay'")
 parser.add_argument("--gpt2_pretrained", action="store_true",
                     help="(For model_type 'gpt2') If set, load pretrained GPT-2 weights; else initialize from config")
@@ -120,8 +128,8 @@ else:
 wandb.init(
     project="music-generation",
     name=wandb_run_name,
-    # id="55g5xmge",         # exactly the same ID as the original run
-    # resume="allow",
+    #id="or6w68a3",         # exactly the same ID as the original run
+    #resume="allow",
     config={
         "data_percent": args.data_percent,
         "instrument_classes": track_classes,
@@ -155,6 +163,7 @@ class MusicDataset(Dataset):
         self.track_class_counts = {tc: 0 for tc in track_classes}
         self.provider = StackDelayPatternProvider(n_q=4)
         self.pattern  = self.provider.get_pattern(timesteps=T)
+
         for sample_id, sample_dict in data.items():
             for subsample_id, tracks in sample_dict["generation_data"].items():
                 for track_class in track_classes:
@@ -172,10 +181,8 @@ class MusicDataset(Dataset):
     def __getitem__(self, idx):
         sample_id, subsample_id, track_class = self.valid_pairs[idx]
         sample_dict = self.data[sample_id]
-
         if self.mode == "delay":
             # constants
-            BASE_AUDIO_VOCAB_SIZE = 1024       # 0‥1023 per codebook
             IGNORE_INDEX = BASE_AUDIO_VOCAB_SIZE
             PAD_TOKEN     = BASE_AUDIO_VOCAB_SIZE
 
@@ -242,49 +249,69 @@ class MusicDataset(Dataset):
             vocal_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"]  # (C_v, T)
             track_codes = sample_dict["generation_data"][subsample_id][track_class]["encodec"]  # (C_t, T)
             pos_emb = sample_dict["positional_embedding"][subsample_id]                        # (T, D)
-            interval = 50
+
+            # Determine number of codebooks for this stem
+            C_t, T = track_codes.shape
 
             # --- prepare input_ids from vocals ---
             C_v, T = vocal_codes.shape
-            # interleave time-major: [c0@t0, c1@t0, ..., c(C-1)@t0, c0@t1, ...]
-            vocal_interleaved = vocal_codes.T.reshape(-1)
+            # interleave time-major: [c0@t0, c1@t0, ..., c(C_v−1)@t0, c0@t1, ...]
+            vocal_interleaved = vocal_codes.T.reshape(-1)  # length = C_v * T
             offsets_v = np.tile(np.arange(C_v) * BASE_AUDIO_VOCAB_SIZE, T)
             vocal_flat = np.clip(vocal_interleaved, 0, BASE_AUDIO_VOCAB_SIZE - 1) + offsets_v
-            input_ids = np.pad(vocal_flat,
-                               (0, MAX_LENGTH - vocal_flat.shape[0]),
-                               mode='constant')[:MAX_LENGTH]
+            input_ids = np.pad(
+                vocal_flat,
+                (0, MAX_LENGTH - vocal_flat.shape[0]),
+                mode='constant'
+            )[:MAX_LENGTH]
 
             # --- prepare labels from track ---
-            C_t, _ = track_codes.shape
-            track_interleaved = track_codes.T.reshape(-1)
+            track_interleaved = track_codes.T.reshape(-1)  # length = C_t * T
             offsets_t = np.tile(np.arange(C_t) * BASE_AUDIO_VOCAB_SIZE, T)
             track_flat = np.clip(track_interleaved, 0, BASE_AUDIO_VOCAB_SIZE - 1) + offsets_t
-            labels = np.pad(track_flat,
-                            (0, MAX_LENGTH - track_flat.shape[0]),
-                            mode='constant',
-                            constant_values=-100)[:MAX_LENGTH]
+            # # ── DEBUG BLOCK: count zeros in un-padded track_flat ──
+            # total_frames = track_flat.shape[0]
+            # zero_count = int((track_flat == 0).sum())
+            # nonzero_count = total_frames - zero_count
+            # print(f"[DEBUG __getitem__] sample_id={sample_id}, subsample_id={subsample_id}, "
+            #     f"track_class={track_class}, C_t={C_t}")
+            # print(f"  → Unpadded flattened frames = {total_frames}")
+            # print(f"  → zero‐valued codes         = {zero_count}  ({100 * zero_count / total_frames:.1f}%)")
+            # print(f"  → nonzero‐valued codes      = {nonzero_count}  ({100 * nonzero_count / total_frames:.1f}%)")
+            # # ── end DEBUG BLOCK ──
+
+            # Now pad with -100 for the loss (ignore_index)
+            labels = np.pad(
+                track_flat,
+                (0, MAX_LENGTH - track_flat.shape[0]),
+                mode='constant',
+                constant_values=-100
+            )[:MAX_LENGTH]
 
             # --- positional embeddings: repeat per channel ---
-            pos_rep = np.repeat(pos_emb, repeats=C_t, axis=0)  # (C_t*T, D)
-            positional_embedding = np.pad(pos_rep,
-                                          ((0, MAX_LENGTH - pos_rep.shape[0]), (0, 0)),
-                                          mode='constant')[:MAX_LENGTH]
+            pos_rep = np.repeat(pos_emb, repeats=C_t, axis=0)  # (C_t * T, D)
+            positional_embedding = np.pad(
+                pos_rep,
+                ((0, MAX_LENGTH - pos_rep.shape[0]), (0, 0)),
+                mode='constant'
+            )[:MAX_LENGTH]
 
             # --- attention mask ---
             attention_mask = (input_ids != 0).astype(int)
 
-            # --- instrument token, sparse injection ---
             inst_token = np.full(MAX_LENGTH, instrument_class_index[track_class], dtype=int)
-            # pack into tensors
+
+            # pack into tensors and return
             return {
-                "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-                "labels": torch.tensor(labels, dtype=torch.long),
-                "positional_embedding": torch.tensor(positional_embedding, dtype=torch.float),
-                "instrument_token": torch.tensor(inst_token, dtype=torch.long),
-                "track_class": track_class,
-                "sample_id": sample_id
+                "input_ids":           torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask":      torch.tensor(attention_mask, dtype=torch.long),
+                "labels":              torch.tensor(labels, dtype=torch.long),
+                "positional_embedding":torch.tensor(positional_embedding, dtype=torch.float),
+                "instrument_token":    torch.tensor(inst_token, dtype=torch.long),
+                "track_class":         track_class,
+                "sample_id":           sample_id
             }
+
         else:
             vocal_audio_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"]
             track_data = sample_dict["generation_data"][subsample_id][track_class]["encodec"]
@@ -321,9 +348,11 @@ class MusicDataset(Dataset):
 # Data Collator (Unified)
 #########################################
 class DataCollatorWithPositionalEmbeddings:
-    def __init__(self, mode: str = "shared", cond_drop_prob: float = 0.2):
+    def __init__(self, mode: str = "shared", cond_drop_prob: float = 0, *, kmeans=None, token_embedding=None):
         self.mode = mode
-        self.cond_drop_prob = cond_drop_prob 
+        self.cond_drop_prob = cond_drop_prob
+        self.kmeans = kmeans
+        self.token_embedding = token_embedding
 
     def __call__(self, batch):
         if self.mode == "delay":
@@ -362,6 +391,7 @@ class DataCollatorWithPositionalEmbeddings:
             pos_emb = torch.stack([b["positional_embedding"] for b in batch]).to(device)
             labels      = torch.stack([b["labels"]            for b in batch]).to(device)
 
+
             B, T = labels.shape
             # teacher‐forcing: shift right with a zero‐start token (or use a learned BOS id)
             start_token      = torch.full((B, 1), BOS_SEP, dtype=torch.long, device=device)
@@ -370,8 +400,7 @@ class DataCollatorWithPositionalEmbeddings:
             # —— classifier-free guidance setup —— 
             if random.random() < self.cond_drop_prob:
                 # drop both vocal and instrument conditioning
-                vocal = torch.zeros_like(vocal)
-                inst  = torch.zeros_like(inst)
+                inst = torch.zeros_like(inst)
             # ————————————————————————————————
 
             return {
@@ -394,7 +423,8 @@ class DataCollatorWithPositionalEmbeddings:
 # -------------------------------
 # Determine Dataset Mode and Vocabulary
 # -------------------------------
-if args.model_type == "flattening_separate":
+
+if args.model_type in ("flattening_separate", "flattening_separate_curriculum"):
     dataset_mode = "separate"
     current_vocab_size = TOTAL_AUDIO_VOCAB_SIZE
 elif args.model_type == "delay":
@@ -431,6 +461,17 @@ elif args.model_type == "flattening_separate":
         device=device,
         bos_token_id=BOS_SEP,
     )
+elif args.model_type == "flattening_separate_curriculum":
+    model = CurriculumFlatteningSeparateLM(
+        max_length=MAX_LENGTH,
+        num_instruments=num_instruments,
+        embed_dim=128,
+        num_layers=6,
+        num_heads=8,
+        dropout=0,
+        base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
+        bos_token_id=BOS_SEP,
+    )
 elif args.model_type == "delay":
     model = init_delay_model(
         codebook_size=BASE_AUDIO_VOCAB_SIZE,
@@ -442,6 +483,7 @@ elif args.model_type == "delay":
         dropout=0.1,
         device=device
     )
+
 else:  # flattening_shared
     model = init_flattening_model(
         vocab_size=current_vocab_size,
@@ -460,15 +502,25 @@ else:  # flattening_shared
 dataset_instance = MusicDataset(data, instrument_token_map, mode=dataset_mode)
 if len(dataset_instance) == 0:
     raise ValueError("No valid samples found for your track classes.")
-train_indices, val_indices = train_test_split(range(len(dataset_instance)), test_size=0.2, random_state=42)
+
+random.seed(42)
+all_indices = list(range(len(dataset_instance)))
+small_indices = random.sample(all_indices, 32)
+overfit_subset = torch.utils.data.Subset(dataset_instance, small_indices)
+print(f"🔍 Overfit subset length = {len(overfit_subset)} (should be 32)")
+
+train_indices, val_indices = train_test_split(range(len(dataset_instance)), test_size=0.1, random_state=42)
 train_dataset = torch.utils.data.Subset(dataset_instance, train_indices)
 val_dataset = torch.utils.data.Subset(dataset_instance, val_indices)
+
+single_index = random.choice(range(len(dataset_instance)))
+overfit_single = torch.utils.data.Subset(dataset_instance, [single_index])
 
 # -------------------------------
 # Training Arguments & Dynamic Eval Setup (Unified)
 # -------------------------------
 training_args = TrainingArguments(
-    output_dir="./results",
+    output_dir="E:/results_separate_flattening",
     eval_strategy="steps",
     save_strategy="steps",   # Save strategy will match evaluation
     # eval_steps and save_steps will be set dynamically below
@@ -489,76 +541,130 @@ training_args = TrainingArguments(
     dataloader_pin_memory=False,
     report_to=["wandb"],
     save_safetensors=False,
-    remove_unused_columns=False
+    remove_unused_columns=False,
+    max_grad_norm=1.0,
 )
 
-total_train_steps = (len(train_dataset) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
-training_args.warmup_steps = total_train_steps // 4
-training_args.eval_steps = 5000
-training_args.save_steps = 5000
+total_train_steps = (len(overfit_subset) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
+training_args.warmup_steps = 1000
+training_args.eval_steps = 10000
+training_args.save_steps = 10000
 print(f"Total training steps: {total_train_steps}")
 print(f"Logging 5 audio samples per evaluation.")
-print(f"Evaluating and saving every 2000 steps.")
+print(f"Evaluating and saving every 5000 steps.")
 # -------------------------------
 # Instantiate Trainer (Unified)
 # -------------------------------
 
-class DelayTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # 1) forward
-        outputs = model(**inputs)
-        loss    = outputs["loss"]
+callbacks = [
+    LrLoggerCallback(),
+    EvalAudioLoggerCallback(device=device, model_type=args.model_type),
+]
 
-        # 2) extract per‐codebook losses and convert to Python floats
-        metrics = {
-            f"loss_codebook_{i}": outputs[f"loss_codebook_{i}"].item()
-            for i in range(model.K)
-        }
-        # include the overall loss as well
-        metrics["loss"] = loss.item()
+# if we're using the curriculum model, append its scheduler
+if args.model_type == "flattening_separate_curriculum":
+    # map: at step 0 → stage 1, 5000 → stage 2, 10000 → stage 3, 15000 → stage 4
+    schedule_map = {0: 1, 60000: 2, 120000: 3, 180000: 4}
+    callbacks.append(CurriculumScheduler(schedule_map))
 
-        # 3) log everything in one call at the correct step
-        self.log(metrics, step=self.state.global_step)
+# now pass that list into your Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    data_collator=data_collator,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    callbacks=callbacks,
+)
 
-        if return_outputs:
-            return loss, outputs
-        return loss
-    
-    
-if args.model_type == "delay":
-    trainer = DelayTrainer(
-        model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        callbacks=[
-            LrLoggerCallback(),
-            EvalAudioLoggerCallback(device=device, model_type=args.model_type),
-        ]
-    )
-else:
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        data_collator=data_collator,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        callbacks=[
-            LrLoggerCallback(),
-            EvalAudioLoggerCallback(device=device, model_type=args.model_type),
-        ]
-    )
 
+# ───────────────────────────────────────────
+# DROP-IN: 1-STEP GRADIENT CHECK
+# ───────────────────────────────────────────
+print("\n▶️ Running a one-step forward/backward check on the single-sample subset…")
+
+from torch.utils.data import DataLoader
+
+toy_loader = DataLoader(
+    overfit_single,
+    batch_size=1,
+    shuffle=False,
+    collate_fn=data_collator
+)
 
 # -------------------------------
 # Train and Save
 # -------------------------------
 
 # print(">>> Before resume, global_step =", trainer.state.global_step)
-# trainer.train(resume_from_checkpoint="./results/checkpoint-30000")
+# trainer.train(resume_from_checkpoint="E:/results_curriculum/checkpoint-30000")
 # print(">>> After resume call, global_step =", trainer.state.global_step)
 trainer.train()
+metrics = trainer.evaluate()
+print("Final eval on best checkpoint:", metrics)
 model_save_path = f"./saved_model_{wandb_run_name}"
 trainer.save_model(model_save_path)
-print(f"✅ Model saved to {model_save_path}.")
+print(f"✅ Model saved to {model_save_path}.") 
+
+
+model = init_flattening_separate_model(
+    base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
+    max_length=MAX_LENGTH,
+    num_instruments=num_instruments,
+    embed_dim=128,
+    num_layers=6,
+    num_heads=8,
+    dropout=0.1,
+    device=device,
+    bos_token_id=BOS_SEP,
+)
+state_dict = torch.load(model_save_path / "pytorch_model.bin")
+model.load_state_dict(state_dict)
+model.to(device).eval()
+
+# Re‐use the same DataCollator from training:
+data_collator = DataCollatorWithPositionalEmbeddings(mode="separate", cond_drop_prob=0)
+
+# Pick one batch from your train or val set:
+from torch.utils.data import DataLoader
+single_loader = DataLoader(train_dataset,
+                           batch_size=1,
+                           shuffle=False,
+                           collate_fn=data_collator)
+
+batch = next(iter(single_loader))
+input_ids = batch["input_ids"].to(device)
+voc_ctx    = batch["vocal_context"].to(device)
+inst_tok   = batch["instrument_token"].to(device)
+pos_emb    = batch["positional_embedding"].to(device)
+labels     = batch["labels"].to(device)
+
+with torch.no_grad():
+    outputs = model(
+        input_ids=input_ids,
+        vocal_context=voc_ctx,
+        instrument_token=inst_tok,
+        positional_embedding=pos_emb,
+        labels=None,
+        use_cache=False
+    )
+    logits = outputs["logits"]  # shape [1, T, C*V]
+
+# Now inspect logits in the “tail” region (e.g. t ∈ [150, 200]):
+num_codebooks = model.codebook_count
+V = model.base_vocab_size
+logits_CV = logits.view(1, logits.size(1), num_codebooks, V)
+
+start_pos = 150
+end_pos   = 200
+head_idx  = 0
+
+import numpy as np
+
+print("\n–––– Inspecting logits (no inst token) ––––")
+for t in range(start_pos, end_pos):
+    true_label = labels[0, t].item()
+    logit_slice = logits_CV[0, t, head_idx, :].cpu().numpy()
+    topk = np.argsort(logit_slice)[-5:][::-1]
+    topk_probs = np.exp(logit_slice[topk]) / np.exp(logit_slice).sum()
+    print(f" t={t:4d}  true={true_label:4d}  top5={topk.tolist()}  probs≈{topk_probs.round(3).tolist()}")
