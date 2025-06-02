@@ -14,7 +14,7 @@ from utils.embeddings_4_bands import convert_4_to_2_band
 from utils.patterns import StackDelayPatternProvider
 
 # Import model initialization helpers from our utility module.
-from utils.models import init_flattening_model, init_flattening_separate_model, init_gpt2_model, init_delay_model
+from utils.models import init_flattening_model, init_flattening_separate_big_head_model, init_flattening_separate_multiple_heads_model, init_gpt2_model, init_delay_model
 from utils.models_flattening_separate_curriculum import CurriculumFlatteningSeparateLM
 from utils.curriculum_schedular import CurriculumScheduler
 
@@ -50,7 +50,7 @@ parser.add_argument(
     help="Instrument classes to include in training"
 )
 parser.add_argument("--model_type", type=str, default="flattening_shared",
-                    choices=["flattening_shared", "flattening_separate", "flattening_separate_curriculum", "gpt2", "delay"],
+                    choices=["flattening_shared", "flattening_separate_big_head", "flattening_separate_multiple_heads", "flattening_separate_curriculum", "gpt2", "delay"],
                     help="Choose the model to train: 'flattening_shared', 'flattening_separate', 'gpt2', or 'delay'")
 parser.add_argument("--gpt2_pretrained", action="store_true",
                     help="(For model_type 'gpt2') If set, load pretrained GPT-2 weights; else initialize from config")
@@ -87,15 +87,15 @@ print("\n✅ Data loaded (all sample IDs).")
 
 first_sample = next(iter(data.values()))
 any_sub = next(iter(first_sample["generation_data"].values()))
-T = any_sub["full_instrumental"]["encodec"].shape[1]  # e.g. 750
+T = 450  # e.g. 750
 
 # -------------------------------
 # Constants and Configurations
 # -------------------------------
 if args.model_type == "delay":
-    MAX_LENGTH = 750
+    MAX_LENGTH = 450
 else:
-    MAX_LENGTH = 3000
+    MAX_LENGTH = 1800
 
 # For flattening_shared and gpt2, we use VOCAB_SIZE computed from the instrument_token_map.
 # For flattening_separate, we use a base audio vocabulary of 1024 and total vocab size = 1024 * num_channels.
@@ -222,7 +222,7 @@ class MusicDataset(Dataset):
             ext_pos_emb = np.pad(
                 pos_emb,
                 ((0, pad_len), (0, 0)),
-                mode="constant"
+                mode="constant",
             ).astype(np.float32)  # (S, D)
 
             # 4) instrument token per step [S]
@@ -259,11 +259,13 @@ class MusicDataset(Dataset):
             vocal_interleaved = vocal_codes.T.reshape(-1)  # length = C_v * T
             offsets_v = np.tile(np.arange(C_v) * BASE_AUDIO_VOCAB_SIZE, T)
             vocal_flat = np.clip(vocal_interleaved, 0, BASE_AUDIO_VOCAB_SIZE - 1) + offsets_v
-            input_ids = np.pad(
-                vocal_flat,
-                (0, MAX_LENGTH - vocal_flat.shape[0]),
-                mode='constant'
-            )[:MAX_LENGTH]
+            flat_len = vocal_flat.shape[0]
+            if flat_len >= MAX_LENGTH:
+                input_ids = vocal_flat[:MAX_LENGTH]
+            else:
+                pad_amount = MAX_LENGTH - flat_len
+                input_ids = np.pad(vocal_flat, (0, pad_amount), mode='constant')
+
 
             # --- prepare labels from track ---
             track_interleaved = track_codes.T.reshape(-1)  # length = C_t * T
@@ -281,20 +283,25 @@ class MusicDataset(Dataset):
             # # ── end DEBUG BLOCK ──
 
             # Now pad with -100 for the loss (ignore_index)
-            labels = np.pad(
-                track_flat,
-                (0, MAX_LENGTH - track_flat.shape[0]),
-                mode='constant',
-                constant_values=-100
-            )[:MAX_LENGTH]
+            flat_len = track_flat.shape[0]
+            if flat_len >= MAX_LENGTH:
+                labels = track_flat[:MAX_LENGTH]
+            else:
+                pad_amount = MAX_LENGTH - flat_len
+                labels = np.pad(track_flat, (0, pad_amount), mode='constant', constant_values=-100)
+
 
             # --- positional embeddings: repeat per channel ---
             pos_rep = np.repeat(pos_emb, repeats=C_t, axis=0)  # (C_t * T, D)
+            rep_len = pos_rep.shape[0]
+            pad_rows = max(0, MAX_LENGTH - rep_len)
+            # pad only when rep_len < MAX_LENGTH; if rep_len ≥ MAX_LENGTH, np.pad(...)[ :MAX_LENGTH ] will simply slice
             positional_embedding = np.pad(
                 pos_rep,
-                ((0, MAX_LENGTH - pos_rep.shape[0]), (0, 0)),
-                mode='constant'
+                ((0, pad_rows), (0, 0)),
+                mode='constant',
             )[:MAX_LENGTH]
+            
 
             # --- attention mask ---
             attention_mask = (input_ids != 0).astype(int)
@@ -400,8 +407,11 @@ class DataCollatorWithPositionalEmbeddings:
             # —— classifier-free guidance setup —— 
             if random.random() < self.cond_drop_prob:
                 # drop both vocal and instrument conditioning
-                inst = torch.zeros_like(inst)
+                pos_emb = torch.zeros_like(pos_emb)
+                vocal = torch.zeros_like(vocal)
             # ————————————————————————————————
+
+            pos_emb = pos_emb * 0.5
 
             return {
                 "input_ids":           target_input_ids,   # shifted targets
@@ -424,7 +434,7 @@ class DataCollatorWithPositionalEmbeddings:
 # Determine Dataset Mode and Vocabulary
 # -------------------------------
 
-if args.model_type in ("flattening_separate", "flattening_separate_curriculum"):
+if args.model_type in ("flattening_separate_big_head", "flattening_separate_multiple_heads", "flattening_separate_curriculum"):
     dataset_mode = "separate"
     current_vocab_size = TOTAL_AUDIO_VOCAB_SIZE
 elif args.model_type == "delay":
@@ -434,7 +444,7 @@ else:
     dataset_mode = "shared"
     current_vocab_size = VOCAB_SIZE
 
-data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode)
+data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0.1)
 
 # -------------------------------
 # Initialize the Model Based on --model_type
@@ -449,8 +459,20 @@ if args.model_type == "gpt2":
         device=device,
         pretrained=args.gpt2_pretrained
     )
-elif args.model_type == "flattening_separate":
-    model = init_flattening_separate_model(
+elif args.model_type == "flattening_separate_big_head":
+    model = init_flattening_separate_big_head_model(
+        base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
+        max_length=MAX_LENGTH,
+        num_instruments=num_instruments,
+        embed_dim=128,
+        num_layers=6,
+        num_heads=8,
+        dropout=0.1,
+        device=device,
+        bos_token_id=BOS_SEP,
+    )
+elif args.model_type == "flattening_separate_multiple_heads":
+    model = init_flattening_separate_multiple_heads_model(
         base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
         max_length=MAX_LENGTH,
         num_instruments=num_instruments,
@@ -558,7 +580,7 @@ print(f"Evaluating and saving every 5000 steps.")
 
 callbacks = [
     LrLoggerCallback(),
-    EvalAudioLoggerCallback(device=device, model_type=args.model_type),
+    EvalAudioLoggerCallback(device=device, model_type=args.model_type, codebook_count=4, codebook_length=450),
 ]
 
 # if we're using the curriculum model, append its scheduler
@@ -605,66 +627,3 @@ print("Final eval on best checkpoint:", metrics)
 model_save_path = f"./saved_model_{wandb_run_name}"
 trainer.save_model(model_save_path)
 print(f"✅ Model saved to {model_save_path}.") 
-
-
-model = init_flattening_separate_model(
-    base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
-    max_length=MAX_LENGTH,
-    num_instruments=num_instruments,
-    embed_dim=128,
-    num_layers=6,
-    num_heads=8,
-    dropout=0.1,
-    device=device,
-    bos_token_id=BOS_SEP,
-)
-state_dict = torch.load(model_save_path / "pytorch_model.bin")
-model.load_state_dict(state_dict)
-model.to(device).eval()
-
-# Re‐use the same DataCollator from training:
-data_collator = DataCollatorWithPositionalEmbeddings(mode="separate", cond_drop_prob=0)
-
-# Pick one batch from your train or val set:
-from torch.utils.data import DataLoader
-single_loader = DataLoader(train_dataset,
-                           batch_size=1,
-                           shuffle=False,
-                           collate_fn=data_collator)
-
-batch = next(iter(single_loader))
-input_ids = batch["input_ids"].to(device)
-voc_ctx    = batch["vocal_context"].to(device)
-inst_tok   = batch["instrument_token"].to(device)
-pos_emb    = batch["positional_embedding"].to(device)
-labels     = batch["labels"].to(device)
-
-with torch.no_grad():
-    outputs = model(
-        input_ids=input_ids,
-        vocal_context=voc_ctx,
-        instrument_token=inst_tok,
-        positional_embedding=pos_emb,
-        labels=None,
-        use_cache=False
-    )
-    logits = outputs["logits"]  # shape [1, T, C*V]
-
-# Now inspect logits in the “tail” region (e.g. t ∈ [150, 200]):
-num_codebooks = model.codebook_count
-V = model.base_vocab_size
-logits_CV = logits.view(1, logits.size(1), num_codebooks, V)
-
-start_pos = 150
-end_pos   = 200
-head_idx  = 0
-
-import numpy as np
-
-print("\n–––– Inspecting logits (no inst token) ––––")
-for t in range(start_pos, end_pos):
-    true_label = labels[0, t].item()
-    logit_slice = logits_CV[0, t, head_idx, :].cpu().numpy()
-    topk = np.argsort(logit_slice)[-5:][::-1]
-    topk_probs = np.exp(logit_slice[topk]) / np.exp(logit_slice).sum()
-    print(f" t={t:4d}  true={true_label:4d}  top5={topk.tolist()}  probs≈{topk_probs.round(3).tolist()}")

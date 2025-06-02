@@ -91,7 +91,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     max_length=model.max_length,
                     do_sample=True,
                     top_k=50,
-                    temperature=0.8
+                    temperature=1
                 ).to(self.device)
             elif isinstance(model, CustomGPT2ForConditionalGeneration):
                 preds = model.generate(
