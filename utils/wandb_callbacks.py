@@ -13,6 +13,7 @@ from utils.models_flattening_separate_curriculum import  CurriculumFlatteningSep
 from transformers import GPT2Tokenizer
 import numpy as np
 from torch.utils.data import Subset
+from utils.models_flattening import CustomFlatteningSharedTransformerLM
 
 
 
@@ -26,6 +27,16 @@ class LrLoggerCallback(TrainerCallback):
             lr = trainer.optimizer.param_groups[0]["lr"]
             wandb.log({"learning_rate": lr, "step": state.global_step})
 
+def deinterleave_flattening_shared(flat_1d: torch.Tensor, C: int) -> torch.Tensor:
+    """
+    flat_1d : 1-D tensor of length C*L produced with time-major flattening
+    returns : (C , L) tensor ready for EnCodec.decode
+    """
+    L = flat_1d.numel() // C          # truncate any pad on the right
+    flat_1d = flat_1d[: C * L]        #   (keeps multiple of C)
+
+    # ❶ reshape to (L , C)   ❷ transpose → (C , L)
+    return flat_1d.view(L, C).t()
 
 class EvalAudioLoggerCallback(TrainerCallback):
     """
@@ -39,7 +50,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
         self.model_type = model_type
         self.codebook_count = codebook_count
         self.codebook_length = codebook_length
-        self.samples_to_log = 5
+        self.samples_to_log = 4
         self.reference_logged = False  # flag to ensure labels logged once
 
         # Preload EnCodec processor & model
@@ -47,20 +58,17 @@ class EvalAudioLoggerCallback(TrainerCallback):
         self.model_encodec = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
 
     def on_evaluate(self, args, state, control, model=None, eval_dataloader=None, **kwargs):
-        ds = eval_dataloader.dataset
-        if isinstance(ds, Subset):
-            ds = ds.dataset
-        # this is *exactly* the Pattern you used in __getitem__
-        pattern = ds.pattern
         model.eval()
         batch = next(iter(eval_dataloader))
 
         # Build inputs
-        if isinstance(model, CustomFlatteningSeparateLMHEADS, CustomFlatteningSeparateCodebookBigLMHead):
+        if isinstance(model, (CustomFlatteningSeparateLMHEADS, CustomFlatteningSeparateCodebookBigLMHead)):
             vocal_context = batch["vocal_context"].to(self.device)
         elif isinstance(model, CustomGPT2ForConditionalGeneration):
             vocal_context = batch["input_ids"].to(self.device)
         elif isinstance(model, RVQDelayTransformerLM):
+            vocal_context = batch["vocal_context"].to(self.device)
+        else:
             vocal_context = batch["vocal_context"].to(self.device)
 
         #positional_embedding = batch["positional_embedding"].to(self.device)
@@ -123,15 +131,30 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     max_length=model.max_length,
                     do_sample=True,
                     top_k=50,
-                    temperature=1.0
+                    temperature=1
                 ).to(self.device)
             else:
-                logits = model(
-                    input_ids=vocal_context,
+                vocal_context        = batch["vocal_context"].to(self.device)
+                instrument_token     = batch["instrument_token"].to(self.device)
+                positional_embedding = batch["positional_embedding"].to(self.device)
+                preds = model.generate(
+                    vocal_context=vocal_context,
+                    instrument_token=instrument_token,
                     positional_embedding=positional_embedding,
-                    instrument_token=instrument_token
-                )["logits"]
-                preds = logits.argmax(dim=-1).to(self.device) 
+                    max_length=model.max_length,
+                    do_sample=False,
+                ).to(self.device)
+
+                preds_top_k = model.generate(
+                    vocal_context=vocal_context,
+                    instrument_token=instrument_token,
+                    positional_embedding=positional_embedding,
+                    max_length=model.max_length,
+                    do_sample=True,
+                    top_k=20,
+                    temperature=1.2,
+                ).to(self.device)
+
 
         # 1) Log ground-truth labels once
         if not self.reference_logged:
@@ -144,18 +167,20 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     label_seq = torch.stack([ flat_labels[j::C] for j in range(C) ], dim=0)
                     label_seq = label_seq % BASE_AUDIO_VOCAB_SIZE
                 elif isinstance(model, RVQDelayTransformerLM):
+                    filtered = batch["filtered_pattern"][i]
                     seq_labels = labels[i].unsqueeze(0)  # → [1, K, S]
                     # revert_pattern_sequence will return (orig_codes, new_layout, mask)
-                    orig_labels, _, mask = pattern.revert_pattern_sequence(seq_labels, special_token=1024)
+                    orig_labels, _, mask = filtered.revert_pattern_sequence(seq_labels, special_token=1024)
                     # 3) Compute which time‐steps have any real code
-                    valid = mask.any(dim=0)            # → [T]
+                    valid = mask.all(dim=0)            # → [T]
 
                     # 4) Keep only those columns: [K, T_real]
                     codes_real = orig_labels[0, :, valid]
                     # now orig_labels is [1, K, T]; squeeze to [K, T]
                     label_seq = codes_real.squeeze(0).to(self.device)
                 else:
-                    label_seq = labels[i].cpu().view(self.codebook_count, self.codebook_length)
+                    label_seq = labels[i].cpu()
+                    label_seq   = deinterleave_flattening_shared(label_seq, self.codebook_count)
                 print(label_seq.shape, "label shape herum ta")
                 print("min:", label_seq.min().item(), "max:", label_seq.max().item())
 
@@ -189,6 +214,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 flat_preds_top_k = preds_top_k[i].cpu()  # shape: (C * L,)
                 pred_seq_top_k = torch.stack([ flat_preds_top_k[j::C] for j in range(C) ], dim=0)
                 pred_seq_top_k = pred_seq_top_k % BASE_AUDIO_VOCAB_SIZE
+                print(pred_seq.shape, pred_seq_top_k.shape, 'eta herum')
                 codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
                 audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
                 .cpu().squeeze().detach().numpy()
@@ -199,21 +225,25 @@ class EvalAudioLoggerCallback(TrainerCallback):
                         caption=f"Pred Top K #{i}"
                     ), "step": state.global_step})
             elif isinstance(model, RVQDelayTransformerLM):
+                filtered = batch["filtered_pattern"][i]
                 seq_preds = preds[i].unsqueeze(0)  # [1, K, S]
-                orig_preds, _, mask = pattern.revert_pattern_sequence(seq_preds, special_token=1024)
-                valid = mask.any(dim=0)            # → [T]
+                orig_preds, _, mask = filtered.revert_pattern_sequence(seq_preds, special_token=1024)
+                valid = mask.all(dim=0)            # → [T]
 
                 # 4) Keep only those columns: [K, T_real]
                 codes_real = orig_preds[0, :, valid]
                 pred_seq = codes_real.squeeze(0).to(self.device)
 
                 seq_preds_top_k = preds_top_k[i].unsqueeze(0)  # [1, K, S]
-                orig_preds_top_k, _, mask = pattern.revert_pattern_sequence(seq_preds_top_k, special_token=1024)
-                valid = mask.any(dim=0)            # → [T]
+                orig_preds_top_k, _, mask = filtered.revert_pattern_sequence(seq_preds_top_k, special_token=1024)
+                valid = mask.all(dim=0)            # → [T]
 
                 # 4) Keep only those columns: [K, T_real]
                 codes_real_top_k = orig_preds_top_k[0, :, valid]
                 pred_seq_top_k = codes_real_top_k.squeeze(0).to(self.device)
+                print(pred_seq.shape, pred_seq_top_k.shape, 'eta herum')
+                print("min:", pred_seq_top_k.min().item(), "max:", pred_seq_top_k.max().item())
+
                 codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
                 audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
                 .cpu().squeeze().detach().numpy()
@@ -224,7 +254,25 @@ class EvalAudioLoggerCallback(TrainerCallback):
                         caption=f"Pred Top K #{i}"
                     ), "step": state.global_step})
             else:
-                pred_seq = preds[i].cpu().view(self.codebook_count, self.codebook_length)
+                flat_pred_seq      = preds[i].cpu()  
+                pred_seq       = deinterleave_flattening_shared(flat_pred_seq, self.codebook_count)
+
+                flat_preds_top_k = preds_top_k[i].cpu()
+                preds_top_k_deinterleaved = deinterleave_flattening_shared(flat_preds_top_k, self.codebook_count)
+
+                codes_pred_top_k = preds_top_k_deinterleaved.unsqueeze(0).unsqueeze(0).to(self.device)
+                print('shape', codes_pred_top_k.shape)
+                print("min:", codes_pred_top_k.min().item(), "max:", codes_pred_top_k.max().item())
+                audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
+                .cpu().squeeze().detach().numpy()
+                wandb.log({
+                    f"pred_top_k/sample_{i}": wandb.Audio(
+                        audio_pred_top_k,
+                        sample_rate=self.processor.sampling_rate,
+                        caption=f"Pred Top K #{i}"
+                    ), "step": state.global_step})
+
+
             codes_pred = pred_seq.unsqueeze(0).unsqueeze(0).to(self.device)
 
             min_code = int(codes_pred.min().item())
@@ -256,16 +304,18 @@ class EvalAudioLoggerCallback(TrainerCallback):
             plt.close('all')
 
             # --- vocal audio ---
-            if isinstance(model, CustomGPT2ForConditionalGeneration):
-                v_seq = vocal_context[i].cpu().view(self.codebook_count, self.codebook_length)
+            if isinstance(model, (CustomGPT2ForConditionalGeneration, CustomFlatteningSharedTransformerLM)):
+                flat_voc = vocal_context[i].cpu()
+                v_seq       = deinterleave_flattening_shared(flat_voc, self.codebook_count)
             if isinstance(model, (CustomFlatteningSeparateCodebookBigLMHead, CustomFlatteningSeparateLMHEADS, CurriculumFlatteningSeparateLM)):
                 flat_voc = vocal_context[i].cpu()
                 v_seq = torch.stack([ flat_voc[j::C] for j in range(C) ], dim=0)
                 v_seq = v_seq % BASE_AUDIO_VOCAB_SIZE
             if isinstance(model, RVQDelayTransformerLM):
+                filtered = batch["filtered_pattern"][i]
                 seq_vocal = vocal_context[i].unsqueeze(0)  # [1, K, S]
-                orig_vocal, _, mask = pattern.revert_pattern_sequence(seq_vocal, special_token=1024)
-                valid = mask.any(dim=0)            # → [T]
+                orig_vocal, _, mask = filtered.revert_pattern_sequence(seq_vocal, special_token=1024)
+                valid = mask.all(dim=0)            # → [T]
                 # 4) Keep only those columns: [K, T_real]
                 codes_real = orig_vocal[0, :, valid]
                 v_seq = codes_real.squeeze(0).to(self.device)
@@ -283,4 +333,6 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 ), "step": state.global_step
             })
             plt.close('all')
+
+
 

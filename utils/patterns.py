@@ -133,9 +133,11 @@ class DelayedPatternProvider(CodebooksPatternProvider):
             v = []
             for q, delay in enumerate(self.delays):
                 t_for_q = t - delay
-                if t_for_q >= self.flatten_first:
+                # Only keep coordinates in [flatten_first, timesteps−1]:
+                if self.flatten_first <= t_for_q < timesteps:
                     v.append(LayoutCoord(t_for_q, q))
             out.append(v)
+
 
         return Pattern(out, n_q=self.n_q, timesteps=timesteps)
     

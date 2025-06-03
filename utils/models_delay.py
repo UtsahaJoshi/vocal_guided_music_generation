@@ -1,200 +1,184 @@
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
-from einops import rearrange
+import torch.nn.functional as F
 from utils.rotary import Transformer, RotaryEmbedding
+
 
 class RVQDelayTransformerLM(nn.Module):
     """
-    Multi-stream Transformer LM over K codebook streams of size V each.
-    Inputs:
-      · shifted_targets: LongTensor [B, K, S]  (each in 0…V-1, or V as pad)
-      · vocal_context:   LongTensor [B, K, S]
-      · instrument_token:LongTensor [B, S]     (e.g. 0…num_instruments-1)
-      · positional_embedding: FloatTensor [B, S, data_pe_dim]
-      · labels:         LongTensor [B, K, S]
-    Outputs:
-      · loss (if labels is provided)
-      · logits: FloatTensor [B, K, S, V]
+    Multi-stream (K codebooks) Transformer LM that follows a “delay” decoding
+    pattern.  Conditioning sources (token, vocal, positional, instrument,
+    codebook-id) are *concatenated* then linearly projected back to `embed_dim`.
     """
+
+    # ------------------------------------------------------------------ #
     def __init__(
         self,
-        codebook_size: int,     # V (e.g. 1024)
-        num_codebooks: int,     # K (e.g. 4)
-        max_length: int,        # S
-        embed_dim: int = 512,   # now higher capacity
-        num_layers: int = 16,
-        num_heads: int = 32,
+        codebook_size: int,          # V
+        num_codebooks: int,          # K
+        max_length: int,             # S (steps after pattern interleave)
+        embed_dim: int = 128,
+        num_layers: int = 6,
+        num_heads: int = 8,
         dropout: float = 0.1,
         num_instruments: int = 8,
-        data_pe_dim: int = 128,  # your existing PE size
+        data_pe_dim: int = 128,
         use_pruning: bool = False,
     ):
         super().__init__()
-        self.V = codebook_size
-        self.K = num_codebooks
+        self.V, self.K, self.S, self.D = codebook_size, num_codebooks, max_length, embed_dim
         self.max_length = max_length
-        self.use_pruning  = use_pruning
-        D = embed_dim
+        self.ignore_index = codebook_size            # PAD token = V
 
-        # ---- rotary embedding on sequence dim ----
-        self.rotary_emb = RotaryEmbedding(D // num_heads)
+        # ---------- embeddings ------------------------------------------------
+        self.token_embeds = nn.ModuleList(
+            [nn.Embedding(codebook_size + 1, embed_dim, padding_idx=codebook_size)
+             for _ in range(num_codebooks)]
+        )
+        self.codebook_id_embed = nn.Embedding(num_codebooks, embed_dim)
+        self.instrument_embed  = nn.Embedding(num_instruments, embed_dim)
 
-        # ---- one embedding table per codebook stream ----
-        self.token_embeds = nn.ModuleList([
-            nn.Embedding(num_embeddings=codebook_size+1, embedding_dim=D, padding_idx=codebook_size)
-            for _ in range(num_codebooks)
-        ])
+        # PE projection (identity init)
+        self.pe_proj = nn.Linear(data_pe_dim, embed_dim, bias=False)
+        nn.init.eye_(self.pe_proj.weight)
 
-        # ---- instrument embedding ----
-        self.instrument_embed = nn.Embedding(num_instruments, D)
+        # ---------- concat → projection --------------------------------------
+        # 5 sources: tgt, voc, pos, inst, cb
+        self.concat_factor = 5
+        self.concat_proj = nn.Linear(self.concat_factor * embed_dim, embed_dim, bias=False)
+        # block-diagonal identity for stable start
+        with torch.no_grad():
+            eye = torch.eye(embed_dim)                 # (128, 128)
+            # want shape (128, 640)  → repeat across the **columns**
+            self.concat_proj.weight.copy_(eye.repeat(1, self.concat_factor))
 
-        # ---- project your old data PE → D ----
-        self.pe_proj = nn.Linear(data_pe_dim, D)
 
-        # ---- core Transformer body ----
+        # ---------- transformer ---------------------------------------------
         self.transformer = Transformer(
-            dim=D,
-            depth=num_layers,
-            dim_head=D // num_heads,
-            heads=num_heads,
-            attn_dropout=dropout,
-            ff_dropout=dropout,
-            rotary_embed=self.rotary_emb,
-            gating=True,
-            prune_kv=use_pruning,
-            max_kv_len=max_length
+            dim          = embed_dim,
+            depth        = num_layers,
+            dim_head     = embed_dim // num_heads,
+            heads        = num_heads,
+            attn_dropout = dropout,
+            ff_dropout   = dropout,
+            rotary_embed = RotaryEmbedding(embed_dim // num_heads),
+            gating       = True,
+            prune_kv     = use_pruning,
+            max_kv_len   = max_length,
         )
 
-        # ---- one output head per codebook ----
-        self.lm_heads = nn.ModuleList([
-            nn.Linear(D, codebook_size)
-            for _ in range(num_codebooks)
-        ])
+        # ---------- output heads --------------------------------------------
+        self.lm_heads = nn.ModuleList(
+            [nn.Linear(embed_dim, codebook_size) for _ in range(num_codebooks)]
+        )
 
-        # ignore_index for loss
-        self.ignore_index = codebook_size
-
+    # ------------------------------------------------------------------ #
     def forward(
         self,
-        shifted_targets:      torch.LongTensor,       # [B, K, S]
-        vocal_context:        torch.LongTensor,       # [B, K, S]
-        instrument_token:     torch.LongTensor = None,# [B, S]
-        positional_embedding: torch.FloatTensor = None,# [B, S, data_pe_dim]
-        labels:               torch.LongTensor = None # [B, K, S]
+        shifted_targets:      torch.LongTensor,    # [B, K, S]
+        vocal_context:        torch.LongTensor,    # [B, K, S]
+        instrument_token:     torch.LongTensor,    # [B, S]
+        positional_embedding: torch.FloatTensor,   # [B, S, pe_dim]
+        labels:               torch.LongTensor = None,
+        **_,
     ):
         B, K, S = shifted_targets.shape
-        assert K == self.K, f"Expected K={self.K}, got {K}"
+        assert K == self.K, "K mismatch"
 
-        # 1) embed each codebook stream
-        tgt_embeds = [self.token_embeds[q](shifted_targets[:, q]) for q in range(K)]  # list of [B, S, D]
-        voc_embeds = [self.token_embeds[q](vocal_context[:, q])   for q in range(K)]
+        pos_emb = self.pe_proj(positional_embedding)               # [B,S,D]
+        inst_emb = self.instrument_embed(instrument_token)         # [B,S,D]
 
-        # 2) sum across streams
-        tgt_sum = torch.stack(tgt_embeds, dim=0).sum(0)  # [B, S, D]
-        voc_sum = torch.stack(voc_embeds, dim=0).sum(0)
+        cb_emb_single = self.codebook_id_embed.weight.sum(0)       # [D]
+        cb_emb = cb_emb_single.expand(B, S, self.D)                # [B,S,D]
 
-        # 3) instrument embedding
-        if instrument_token is not None:
-            inst_emb = self.instrument_embed(instrument_token)  # [B, S, D]
-        else:
-            inst_emb = torch.zeros_like(tgt_sum)
+        # ---------------- concat all sources -------------------------------
+        concat_streams = []   # will hold 5 tensors, shape [B,S,D]
 
-        # 4) project data PE → D
-        if positional_embedding is not None:
-            pos_emb = self.pe_proj(positional_embedding)      # [B, S, D]
-        else:
-            pos_emb = torch.zeros_like(tgt_sum)
+        # a) positional, b) instrument, c) codebook-id (shared)
+        concat_streams.extend([pos_emb, inst_emb, cb_emb])
 
-        # 5) additive fusion (MusicGen style)
-        x = tgt_sum + voc_sum + inst_emb + pos_emb          # [B, S, D]
-
-        # 6) run through Transformer
-        x = self.transformer(x)  # [B, S, D]
-
-        # 7) per-codebook output heads → [B, K, S, V]
-        logits = torch.stack([head(x) for head in self.lm_heads], dim=1)
-
-        loss_per_codebook = []
+        # d) ⇔ K * tokens; e) ⇔ K * vocals — we sum inside each type then append
+        tgt_sum = 0
+        voc_sum = 0
         for q in range(K):
-            # take logits for codebook q: [B, S, V]
-            logit_q = logits[:, q, :, :]           # [B, S, V]
-            label_q = labels[:, q, :]              # [B, S]
-            loss_q = F.cross_entropy(
-                logit_q.reshape(-1, self.V),       # [B*S, V]
-                label_q.reshape(-1),               # [B*S]
-                ignore_index=self.ignore_index
+            tgt_sum = tgt_sum + self.token_embeds[q](shifted_targets[:, q])
+            voc_sum = voc_sum + self.token_embeds[q](vocal_context[:, q])
+        concat_streams.extend([tgt_sum, voc_sum])
+
+        x_cat = torch.cat(concat_streams, dim=-1)                   # [B,S,5D]
+        x = self.concat_proj(x_cat)                                 # [B,S,D]
+        x = self.transformer(x)                                     # [B,S,D]
+
+        logits = torch.stack([head(x) for head in self.lm_heads], dim=1)  # [B,K,S,V]
+
+        out = {"logits": logits}
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, self.V),
+                labels.view(-1),
+                ignore_index=self.ignore_index,
             )
-            loss_per_codebook.append(loss_q)
+            out["loss"] = loss
+        return out
 
-        # stack into a tensor of shape [K]
-        loss_per_codebook = torch.stack(loss_per_codebook, dim=0)
-
-        # total loss is the sum (or mean) of those
-        loss = loss_per_codebook.mean()
-
-        return {"loss": loss, **{f"loss_codebook_{i}": loss_per_codebook[i] for i in range(K)}, "logits": logits}
-
+    # ------------------------------------------------------------------ #
     @torch.no_grad()
     def generate(
         self,
-        vocal_context:        torch.LongTensor,       # [B, K, S_ctx]
-        instrument_token:     torch.LongTensor = None,# [B, S_ctx]
-        positional_embedding: torch.FloatTensor = None,# [B, S_ctx, data_pe_dim]
+        vocal_context:        torch.LongTensor,      # [B,K,S_ctx]
+        instrument_token:     torch.LongTensor,      # [B,S_ctx]
+        positional_embedding: torch.FloatTensor,     # [B,S_ctx,pe_dim]
         max_length:           int = None,
         do_sample:            bool = False,
         top_k:                int = 50,
         temperature:          float = 1.0,
     ):
         B, K, S_ctx = vocal_context.shape
-        device = vocal_context.device
-        max_length = max_length or self.max_length
+        max_length  = max_length or self.S
+        device      = vocal_context.device
+
+        pos_all  = self.pe_proj(positional_embedding)              # [B,S_ctx,D]
+        inst_all = self.instrument_embed(instrument_token)         # [B,S_ctx,D]
+        cb_emb_single = self.codebook_id_embed.weight.sum(0)       # [D]
 
         gen = torch.full((B, K, 1), self.ignore_index, dtype=torch.long, device=device)
-        past_kvs = None
-        outputs = []
+        past_kv, outs = None, []
 
         for t in range(max_length):
-            # embed last generated
-            last_embeds = [self.token_embeds[q](gen[:, q, -1]) for q in range(K)]
-            tgt_sum = torch.stack(last_embeds, dim=0).sum(0)   # [B, D]
+            pos_step  = pos_all[:, t if t < S_ctx else -1]          # [B,D]
+            inst_step = inst_all[:, t if t < S_ctx else -1]         # [B,D]
+            cb_step   = cb_emb_single.expand(B, self.D)             # [B,D]
 
-            # embed vocal at t
-            voc_embeds = [self.token_embeds[q](vocal_context[:, q, t]) for q in range(K)]
-            voc_sum = torch.stack(voc_embeds, dim=0).sum(0)
+            tgt_sum = voc_sum = torch.zeros(B, self.D, device=device)
+            for q in range(K):
+                tgt_sum += self.token_embeds[q](gen[:, q, -1])      # last gen
+                voc_tok  = vocal_context[:, q, t if t < S_ctx else -1]
+                voc_sum += self.token_embeds[q](voc_tok)
 
-            # inst & pos at t
-            if instrument_token is not None:
-                inst_emb = self.instrument_embed(instrument_token[:, t])
-            else:
-                inst_emb = torch.zeros_like(tgt_sum)
+            x_cat = torch.cat([pos_step, inst_step, cb_step, tgt_sum, voc_sum], dim=-1)  # [B,5D]
+            x_proj = self.concat_proj(x_cat)[:, None]               # [B,1,D]
 
-            if positional_embedding is not None:
-                pos_emb = self.pe_proj(positional_embedding[:, t, :])
-            else:
-                pos_emb = torch.zeros_like(tgt_sum)
+            x_proj, past_kv = self.transformer(
+                x_proj, past_key_values=past_kv, use_cache=True
+            )
 
-            # additive fusion
-            x = (tgt_sum + voc_sum + inst_emb + pos_emb).unsqueeze(1)  # [B,1,D]
+            logits = torch.stack(
+                [head(x_proj.squeeze(1)) for head in self.lm_heads], dim=1
+            )                                                       # [B,K,V]
 
-            # transformer step
-            x, past_kvs = self.transformer(x, past_key_values=past_kvs, use_cache=True)  # [B,1,D]
-            logits = torch.stack([head(x.squeeze(1)) for head in self.lm_heads], dim=1)   # [B,K,V]
-
+            # ---- sample / greedy ----------------------------------------
             if do_sample:
                 logits = logits / max(temperature, 1e-5)
-                topk_vals, topk_idx = logits.topk(top_k, dim=-1)
+                top_vals, top_idx = logits.topk(top_k, -1)
                 mask = torch.ones_like(logits, dtype=torch.bool)
-                mask.scatter_(-1, topk_idx, False)
-                logits = logits.masked_fill(mask, float("-inf"))
-                probs = torch.softmax(logits, dim=-1)
-                flat = probs.view(-1, probs.size(-1))
-                next_tok = torch.multinomial(flat, num_samples=1).view(B, K, 1)
+                mask.scatter_(-1, top_idx, False)
+                logits = logits.masked_fill(mask, -float("inf"))
+                probs  = torch.softmax(logits, -1).view(-1, self.V)
+                next_tok = torch.multinomial(probs, 1).view(B, K, 1)
             else:
-                next_tok = logits.argmax(dim=-1, keepdim=True)  # [B,K,1]
+                next_tok = logits.argmax(-1, keepdim=True)          # [B,K,1]
 
-            gen = torch.cat([gen, next_tok], dim=2)
-            outputs.append(next_tok)
+            gen  = torch.cat([gen, next_tok], dim=2)
+            outs.append(next_tok)
 
-        return torch.cat(outputs, dim=2)  # [B,K,max_length]
-
+        return torch.cat(outs, dim=2)                               # [B,K,T_gen]

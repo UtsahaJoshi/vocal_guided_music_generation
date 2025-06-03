@@ -11,7 +11,7 @@ import wandb
 from collections import defaultdict
 import argparse
 from utils.embeddings_4_bands import convert_4_to_2_band
-from utils.patterns import StackDelayPatternProvider
+from utils.patterns import StackDelayPatternProvider, DelayedPatternProvider
 
 # Import model initialization helpers from our utility module.
 from utils.models import init_flattening_model, init_flattening_separate_big_head_model, init_flattening_separate_multiple_heads_model, init_gpt2_model, init_delay_model
@@ -23,6 +23,24 @@ from utils.load_npz_with_index import load_npz_with_index
 from utils.wandb_callbacks import LrLoggerCallback, EvalAudioLoggerCallback
 
 
+
+def test_delay_roundtrip():
+    K, T = 4, 750
+    codes = torch.randint(0, 1024, (1, K, T))
+    pattern = DelayedPatternProvider(n_q=K).get_pattern(T)
+
+    seq, filt, _ = pattern.build_pattern_sequence(
+        codes, special_token=1024, keep_only_valid_steps=True
+    )
+    restored, _, _ = filt.revert_pattern_sequence(seq, special_token=1024)
+
+    mask = restored != 1024          # ignore padding
+    assert torch.equal(codes[mask], restored[mask]), "Delay round-trip failed"
+
+test_delay_roundtrip()
+print('done')
+
+
 if (torch.cuda.is_available()):
     torch.backends.cuda.sdp_kernel = "flash"
     torch.backends.cudnn.benchmark = True
@@ -32,11 +50,11 @@ if (torch.cuda.is_available()):
 # -------------------------------
 # Device Setup
 # -------------------------------
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 if torch.cuda.is_available():
     print("Number of GPUs:", torch.cuda.device_count())
-    print("GPU name:", torch.cuda.get_device_name(0))
 
 # -------------------------------
 # Command-line Arguments
@@ -87,15 +105,17 @@ print("\n✅ Data loaded (all sample IDs).")
 
 first_sample = next(iter(data.values()))
 any_sub = next(iter(first_sample["generation_data"].values()))
-T = 450  # e.g. 750
 
 # -------------------------------
 # Constants and Configurations
 # -------------------------------
 if args.model_type == "delay":
-    MAX_LENGTH = 450
+    T_RAW = 750                 # audio frames you really want
+    N_DELAY = 3                  # one per codebook
+    MAX_LENGTH = T_RAW + N_DELAY # 453
+
 else:
-    MAX_LENGTH = 1800
+    MAX_LENGTH = 3000
 
 # For flattening_shared and gpt2, we use VOCAB_SIZE computed from the instrument_token_map.
 # For flattening_separate, we use a base audio vocabulary of 1024 and total vocab size = 1024 * num_channels.
@@ -109,6 +129,10 @@ TOTAL_AUDIO_VOCAB_SIZE = BASE_AUDIO_VOCAB_SIZE * 4  # e.g., for 4 channels
 BOS_SEP = TOTAL_AUDIO_VOCAB_SIZE
 SPECIAL_TOKEN = 1024  # out of range
 # For delay mode, we still use VOCAB_SIZE = 1028 and MAX_LENGTH = 3000 (the delay model expects a delay_groups tensor).
+
+AUDIO_VOCAB_SIZE_SHARED  = 1024          # real EnCodec codes 0-1023
+BOS_TOKEN_ID_SHARED      = AUDIO_VOCAB_SIZE_SHARED   # 1024
+TOKEN_VOCAB_SIZE_SHARED  = AUDIO_VOCAB_SIZE_SHARED + 1   # +1 for BOS
 
 # Build run name for WandB.
 all_instruments = ["full_instrumental", "drums", "bass", "melody", "bombo", "platillos", "toms"]
@@ -161,8 +185,7 @@ class MusicDataset(Dataset):
         self.mode = mode
         self.valid_pairs = []
         self.track_class_counts = {tc: 0 for tc in track_classes}
-        self.provider = StackDelayPatternProvider(n_q=4)
-        self.pattern  = self.provider.get_pattern(timesteps=T)
+        self.pattern_cache: dict[int, Pattern] = {}
 
         for sample_id, sample_dict in data.items():
             for subsample_id, tracks in sample_dict["generation_data"].items():
@@ -175,6 +198,14 @@ class MusicDataset(Dataset):
         for k, v in self.track_class_counts.items():
             print(f"{k}: {v}")
 
+    def _get_pattern(self, T, C):
+        """Return a cached Pattern or build one."""
+        pat = self.pattern_cache.get(T)
+        if pat is None:
+            pat = DelayedPatternProvider(n_q=C).get_pattern(T)
+            self.pattern_cache[T] = pat
+        return pat
+
     def __len__(self):
         return len(self.valid_pairs)
 
@@ -182,67 +213,58 @@ class MusicDataset(Dataset):
         sample_id, subsample_id, track_class = self.valid_pairs[idx]
         sample_dict = self.data[sample_id]
         if self.mode == "delay":
-            # constants
             IGNORE_INDEX = BASE_AUDIO_VOCAB_SIZE
-            PAD_TOKEN     = BASE_AUDIO_VOCAB_SIZE
+            PAD_TOKEN    = BASE_AUDIO_VOCAB_SIZE
 
-            # load raw codes
-            vocal_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"]  # np.ndarray (C, T)
-            track_codes = sample_dict["generation_data"][subsample_id][track_class]["encodec"]  # np.ndarray (C, T)
-            pos_emb     = sample_dict["positional_embedding"][subsample_id]                    # np.ndarray (T, D)
+            # 0) load + trim to MAX_LENGTH (=450)
+            vocal_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"][:, :450]   # (C,T)
+            track_codes = sample_dict["generation_data"][subsample_id][track_class]["encodec"][:, :450]
+            pos_emb_np  = sample_dict["positional_embedding"][subsample_id][:450]                     # (T,D)
 
             C, T = track_codes.shape
-            seq_len = T + C - 1  # full delay pattern length
+            pattern = self._get_pattern(T, C)          # delay pattern
 
-            # 1) build the interleaved [1, C, S] from MusicGen pattern
-            codes_t = torch.from_numpy(track_codes).unsqueeze(0).to(device)  # [1, C, T]
+            # 1) interleave audio codes
+            codes_t  = torch.from_numpy(track_codes).unsqueeze(0).to(device)   # [1,C,T]
             vocals_t = torch.from_numpy(vocal_codes).unsqueeze(0).to(device)
 
-            interleaved_track, _, _ = self.pattern.build_pattern_sequence(
-                codes_t,
-                special_token=PAD_TOKEN,
-                keep_only_valid_steps=True
-            )  # [1, C, S]
-            interleaved_vocal, _, _ = self.pattern.build_pattern_sequence(
-                vocals_t,
-                special_token=PAD_TOKEN,
-                keep_only_valid_steps=True
-            )  # [1, C, S]
+            inter_trk , filtered_pattern , _ = pattern.build_pattern_sequence(
+                codes_t,  special_token=PAD_TOKEN, keep_only_valid_steps=True)
+            inter_voc , _ , _ = filtered_pattern.build_pattern_sequence(
+                vocals_t, special_token=PAD_TOKEN, keep_only_valid_steps=True)
 
-            # drop batch‐dim → [C, S]
-            interleaved_track = interleaved_track.squeeze(0)
-            interleaved_vocal = interleaved_vocal.squeeze(0)
+            inter_trk = inter_trk.squeeze(0)   # [C,S]
+            inter_voc = inter_voc.squeeze(0)   # [C,S]
+            S = inter_trk.size(1)
 
-            # 2) shifted targets for teacher forcing: [C, S]
-            shifted = torch.full_like(interleaved_track, IGNORE_INDEX)
-            shifted[:, 1:] = interleaved_track[:, :-1]
+            # 2) build the *same* interleave for the time indices,
+            #    then grab a single stream’s mapping → [S]
+            time_grid = torch.arange(T, device=device).expand(C, T)            # [C,T]
+            time_int , _ , _ = pattern.build_pattern_sequence(
+                time_grid.unsqueeze(0), special_token=-1, keep_only_valid_steps=True)
+            t_idx = time_int.squeeze(0)[0]     # take row 0 ⇒ shape [S]
 
-            # 3) pad pos‐emb from (T, D) → (S, D)
-            pad_len = interleaved_track.size(1) - pos_emb.shape[0]
-            ext_pos_emb = np.pad(
-                pos_emb,
-                ((0, pad_len), (0, 0)),
-                mode="constant",
-            ).astype(np.float32)  # (S, D)
+            # fetch the PE rows → [S,D]
+            pos_emb = torch.from_numpy(pos_emb_np).to(device, dtype=torch.float32)[t_idx]
 
-            # 4) instrument token per step [S]
-            inst_tok = torch.full(
-                (interleaved_track.size(1),),
-                instrument_class_index[track_class],
-                dtype=torch.long,
-                device=device
-            )
+            # 3) shifted teacher-forcing targets
+            shifted = torch.full_like(inter_trk, IGNORE_INDEX)
+            shifted[:, 1:] = inter_trk[:, :-1]
+
+            # 4) per-step instrument id  [S]
+            inst_tok = torch.full((S,), instrument_class_index[track_class],
+                                dtype=torch.long, device=device)
 
             return {
-            "vocal_context":        interleaved_vocal,          # torch.LongTensor [C, S]
-            "labels":               interleaved_track,          # torch.LongTensor [C, S]
-            "shifted_targets":      shifted,                    # torch.LongTensor [C, S]
-            "positional_embedding": torch.from_numpy(ext_pos_emb).to(device),  # [S, D]
-            "instrument_token":     inst_tok,                   # [S]
-            "track_class":          track_class,
-            "sample_id":            sample_id
+                "vocal_context":        inter_voc,        # [C,S]
+                "labels":               inter_trk,        # [C,S]
+                "shifted_targets":      shifted,          # [C,S]
+                "positional_embedding": pos_emb,          # [S,D]  ← one copy
+                "instrument_token":     inst_tok,         # [S]
+                "track_class":          track_class,
+                "sample_id":            sample_id,
+                "filtered_pattern":     filtered_pattern
             }
-
 
         elif self.mode == "separate":
             # load raw codes and positional embeddings
@@ -271,16 +293,6 @@ class MusicDataset(Dataset):
             track_interleaved = track_codes.T.reshape(-1)  # length = C_t * T
             offsets_t = np.tile(np.arange(C_t) * BASE_AUDIO_VOCAB_SIZE, T)
             track_flat = np.clip(track_interleaved, 0, BASE_AUDIO_VOCAB_SIZE - 1) + offsets_t
-            # # ── DEBUG BLOCK: count zeros in un-padded track_flat ──
-            # total_frames = track_flat.shape[0]
-            # zero_count = int((track_flat == 0).sum())
-            # nonzero_count = total_frames - zero_count
-            # print(f"[DEBUG __getitem__] sample_id={sample_id}, subsample_id={subsample_id}, "
-            #     f"track_class={track_class}, C_t={C_t}")
-            # print(f"  → Unpadded flattened frames = {total_frames}")
-            # print(f"  → zero‐valued codes         = {zero_count}  ({100 * zero_count / total_frames:.1f}%)")
-            # print(f"  → nonzero‐valued codes      = {nonzero_count}  ({100 * nonzero_count / total_frames:.1f}%)")
-            # # ── end DEBUG BLOCK ──
 
             # Now pad with -100 for the loss (ignore_index)
             flat_len = track_flat.shape[0]
@@ -320,35 +332,51 @@ class MusicDataset(Dataset):
             }
 
         else:
-            vocal_audio_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"]
-            track_data = sample_dict["generation_data"][subsample_id][track_class]["encodec"]
-            pos_emb = sample_dict["positional_embedding"][subsample_id]
-            vocal_audio_codes = np.pad(vocal_audio_codes.flatten(), (0, MAX_LENGTH - len(vocal_audio_codes.flatten())), 'constant')[:MAX_LENGTH]
-            track_data = np.pad(track_data.flatten(), (0, MAX_LENGTH - len(track_data.flatten())), 'constant')[:MAX_LENGTH]
-            attention_mask = (vocal_audio_codes != 0).astype(int)
-            padding_length = MAX_LENGTH - pos_emb.shape[0]
-            pos_emb = np.pad(pos_emb, ((0, padding_length), (0, 0)), 'constant')
-            interval = 50
-            inst_token = np.full(
-                MAX_LENGTH,
-                instrument_class_index[track_class],
-                dtype=int
-            )
-            inst_token[::interval] = instrument_class_index[track_class]
-            n_ignore = int((track_data == -100).sum())
-            total   = track_data.size
+            IGNORE_INDEX = BASE_AUDIO_VOCAB_SIZE
 
-        result = {
-            "input_ids": torch.tensor(vocal_audio_codes, dtype=torch.long),
-            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(track_data, dtype=torch.long),
-            "positional_embedding": torch.tensor(pos_emb, dtype=torch.float),
-            "instrument_token": torch.tensor(inst_token, dtype=torch.long),
-            "track_class": track_class,
-            "sample_id": sample_id
-        }
+            # load and flatten
+            vocal_audio_codes = sample_dict["generation_data"][subsample_id]["vocals"]["encodec"]  # (C, T)
+            track_data        = sample_dict["generation_data"][subsample_id][track_class]["encodec"]  # (C, T)
+            pos_emb           = sample_dict["positional_embedding"][subsample_id]  # (T, D)
 
-        return result
+            # Flatten using .flatten() — time-major assumed
+            vocal_context = vocal_audio_codes.T.flatten()  # (C*T,)
+            track_flat    = track_data.T.flatten()
+
+            # Pad both to MAX_LENGTH
+            pad_v = max(0, MAX_LENGTH - vocal_context.shape[0])
+            pad_t = max(0, MAX_LENGTH - track_flat.shape[0])
+
+            vocal_context = np.pad(vocal_context, (0, pad_v), 'constant')[:MAX_LENGTH]
+            labels        = np.pad(track_flat, (0, pad_t), 'constant', constant_values=-100)[:MAX_LENGTH]
+
+            # Shifted targets
+            shifted_targets = np.full_like(labels, IGNORE_INDEX)
+            shifted_targets[1:] = labels[:-1]
+
+            # Attention mask
+            attention_mask = (vocal_context != 0).astype(int)
+
+            # Positional embeddings (repeat across channels before flattening)
+            C, T = track_data.shape
+            pos_rep = np.repeat(pos_emb, repeats=C, axis=0)  # (C*T, D)
+            pad_rows = max(0, MAX_LENGTH - pos_rep.shape[0])
+            pos_emb_padded = np.pad(pos_rep, ((0, pad_rows), (0, 0)), mode='constant')[:MAX_LENGTH]
+
+            # Instrument token
+            inst_token = np.full(MAX_LENGTH, instrument_class_index[track_class], dtype=int)
+
+            return {
+                "vocal_context":         torch.tensor(vocal_context, dtype=torch.long),
+                "attention_mask":        torch.tensor(attention_mask, dtype=torch.long),
+                "labels":                torch.tensor(labels, dtype=torch.long),
+                "shifted_targets":       torch.tensor(shifted_targets, dtype=torch.long),
+                "positional_embedding": torch.tensor(pos_emb_padded, dtype=torch.float),
+                "instrument_token":     torch.tensor(inst_token, dtype=torch.long),
+                "track_class":          track_class,
+                "sample_id":            sample_id
+            }
+
 
 
 #########################################
@@ -369,6 +397,7 @@ class DataCollatorWithPositionalEmbeddings:
             shifted_targets     = torch.stack([b["shifted_targets"]     for b in batch]).to(device)  # [B, C, S]
             positional_embedding= torch.stack([b["positional_embedding"]for b in batch]).to(device)  # [B, S, D]
             instrument_token    = torch.stack([b["instrument_token"]    for b in batch]).to(device)  # [B, S]
+            filtered_pattern    = ([b["filtered_pattern"] for b in batch])
 
             # ── DEBUG SHAPES ──
             B, K, S = vocal_context.shape
@@ -389,7 +418,8 @@ class DataCollatorWithPositionalEmbeddings:
               "labels":               labels,
               "shifted_targets":      shifted_targets,
               "positional_embedding": positional_embedding,
-              "instrument_token":     instrument_token
+              "instrument_token":     instrument_token,
+              "filtered_pattern":     filtered_pattern
             }
         elif self.mode == "separate":
             # for flattening_separate: build four streams
@@ -421,13 +451,20 @@ class DataCollatorWithPositionalEmbeddings:
                 "labels":              labels,             # ground‐truth for loss
             }
         else:
+            vocal_context       = torch.stack([b["vocal_context"]       for b in batch]).to(device)  # [B, T]
+            labels              = torch.stack([b["labels"]              for b in batch]).to(device)  # [B, T]
+            shifted_targets     = torch.stack([b["shifted_targets"]     for b in batch]).to(device)  # [B, T]
+            positional_embedding= torch.stack([b["positional_embedding"]for b in batch]).to(device)  # [B, T, D]
+            instrument_token    = torch.stack([b["instrument_token"]    for b in batch]).to(device)  # [B, T]
+
             return {
-                "input_ids": torch.stack([b["input_ids"] for b in batch]).to(device),
-                "attention_mask": torch.stack([b["attention_mask"] for b in batch]).to(device),
-                "labels": torch.stack([b["labels"] for b in batch]).to(device),
-                "positional_embedding": torch.stack([b["positional_embedding"] for b in batch]).to(device),
-                "instrument_token": torch.stack([b["instrument_token"] for b in batch]).to(device),
+                "vocal_context":        vocal_context,        # flattened vocal codes
+                "labels":               labels,               # loss targets
+                "shifted_targets":      shifted_targets,      # shifted teacher-forcing input
+                "positional_embedding": positional_embedding, # per-timestep PE (e.g., beat embedding)
+                "instrument_token":     instrument_token      # per-timestep instrument IDs
             }
+
 
 
 # -------------------------------
@@ -442,7 +479,7 @@ elif args.model_type == "delay":
     current_vocab_size = VOCAB_SIZE
 else:
     dataset_mode = "shared"
-    current_vocab_size = VOCAB_SIZE
+    current_vocab_size = AUDIO_VOCAB_SIZE_SHARED
 
 data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0.1)
 
@@ -499,22 +536,24 @@ elif args.model_type == "delay":
         codebook_size=BASE_AUDIO_VOCAB_SIZE,
         num_codebooks=4,
         max_length=MAX_LENGTH,
-        embed_dim=512,
-        num_layers=16,
-        num_heads=32,
+        embed_dim=128,
+        num_layers=8,
+        num_heads=8,
         dropout=0.1,
         device=device
     )
 
 else:  # flattening_shared
     model = init_flattening_model(
-        vocab_size=current_vocab_size,
+        vocab_size=AUDIO_VOCAB_SIZE_SHARED,
         max_length=MAX_LENGTH,
+        num_instruments=num_instruments,
         embed_dim=128,
         num_layers=6,
         num_heads=8,
         dropout=0.1,
-        device=device
+        device=device,
+        bos_token_id=BOS_TOKEN_ID_SHARED,
     )
 
 
@@ -542,7 +581,7 @@ overfit_single = torch.utils.data.Subset(dataset_instance, [single_index])
 # Training Arguments & Dynamic Eval Setup (Unified)
 # -------------------------------
 training_args = TrainingArguments(
-    output_dir="E:/results_separate_flattening",
+    output_dir="E:/results_delay",
     eval_strategy="steps",
     save_strategy="steps",   # Save strategy will match evaluation
     # eval_steps and save_steps will be set dynamically below
@@ -565,12 +604,13 @@ training_args = TrainingArguments(
     save_safetensors=False,
     remove_unused_columns=False,
     max_grad_norm=1.0,
+    gradient_accumulation_steps=2
 )
 
 total_train_steps = (len(overfit_subset) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
 training_args.warmup_steps = 1000
-training_args.eval_steps = 10000
-training_args.save_steps = 10000
+training_args.eval_steps = 5000
+training_args.save_steps = 5000
 print(f"Total training steps: {total_train_steps}")
 print(f"Logging 5 audio samples per evaluation.")
 print(f"Evaluating and saving every 5000 steps.")
@@ -580,7 +620,7 @@ print(f"Evaluating and saving every 5000 steps.")
 
 callbacks = [
     LrLoggerCallback(),
-    EvalAudioLoggerCallback(device=device, model_type=args.model_type, codebook_count=4, codebook_length=450),
+    EvalAudioLoggerCallback(device=device, model_type=args.model_type, codebook_count=4, codebook_length=750),
 ]
 
 # if we're using the curriculum model, append its scheduler
