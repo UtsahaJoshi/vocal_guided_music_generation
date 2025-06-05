@@ -72,7 +72,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
             vocal_context = batch["vocal_context"].to(self.device)
 
         #positional_embedding = batch["positional_embedding"].to(self.device)
-        instrument_token    = batch["instrument_token"].to(self.device)
+        #instrument_token    = batch["instrument_token"].to(self.device)
         labels = batch["labels"].to(self.device)
         batch_size = labels.size(0)
 
@@ -80,27 +80,35 @@ class EvalAudioLoggerCallback(TrainerCallback):
         with torch.no_grad():
             if isinstance(model, (CustomFlatteningSeparateCodebookBigLMHead, CustomFlatteningSeparateLMHEADS,  CurriculumFlatteningSeparateLM)):
                 vocal_context        = batch["vocal_context"].to(self.device)
-                instrument_token     = batch["instrument_token"].to(self.device)
-                positional_embedding = batch["positional_embedding"].to(self.device)
+                # instrument_token     = batch["instrument_token"].to(self.device)
+                # positional_embedding = batch["positional_embedding"].to(self.device)
 
                 # Generate autoregressively up to full length:
                 max_len = model.max_length  # e.g. 3000
                 preds = model.generate(
                     vocal_context=vocal_context,
-                    instrument_token=instrument_token,
-                    positional_embedding=positional_embedding,
+                    #instrument_token=instrument_token,
+                    # positional_embedding=positional_embedding,
                     max_length=max_len,
                     do_sample=False,
                 ).to(self.device)   # [B, max_len]
                 C = self.codebook_count
                 preds_top_k = model.generate(
                     vocal_context=vocal_context,
-                    instrument_token=instrument_token,
-                    positional_embedding=positional_embedding,
+                    # instrument_token=instrument_token,
+                    # positional_embedding=positional_embedding,
                     max_length=model.max_length,
                     do_sample=True,
                     top_k=50,
-                    temperature=1
+                    temperature=0.8
+                ).to(self.device)
+                preds_nucleus = model.generate(
+                    vocal_context=vocal_context,
+                    max_length=model.max_length,
+                    do_sample=True,
+                    top_k=None,       # either omit or explicitly set to None
+                    top_p=0.90,       # <-- this turns on nucleus sampling
+                    temperature=0.8
                 ).to(self.device)
             elif isinstance(model, CustomGPT2ForConditionalGeneration):
                 preds = model.generate(
@@ -221,6 +229,19 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 wandb.log({
                     f"pred_top_k/sample_{i}": wandb.Audio(
                         audio_pred_top_k,
+                        sample_rate=self.processor.sampling_rate,
+                        caption=f"Pred Top K #{i}"
+                    ), "step": state.global_step})
+
+                flat_preds_nucleus = preds_nucleus[i].cpu()  # shape: (C * L,)
+                pred_seq_nucleus = torch.stack([ flat_preds_nucleus[j::C] for j in range(C) ], dim=0)
+                pred_seq_nucleus = pred_seq_nucleus % BASE_AUDIO_VOCAB_SIZE
+                codes_pred_nucleus = pred_seq_nucleus.unsqueeze(0).unsqueeze(0).to(self.device)
+                audio_pred_nucleus = self.model_encodec.decode(codes_pred_nucleus, [None])[0] \
+                .cpu().squeeze().detach().numpy()
+                wandb.log({
+                    f"pred_nucleus/sample_{i}": wandb.Audio(
+                        audio_pred_nucleus,
                         sample_rate=self.processor.sampling_rate,
                         caption=f"Pred Top K #{i}"
                     ), "step": state.global_step})
