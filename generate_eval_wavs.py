@@ -20,8 +20,10 @@ from train import (
     init_delay_model,
 )
 
+
 from utils.load_npz_with_index import load_npz_with_index
 from utils.wandb_callbacks import deinterleave_flattening_shared
+from torch.amp import autocast
 
 
 def build_dataset_and_split(npz_path, index_path, instrument_classes, data_percent, model_type):
@@ -68,15 +70,15 @@ def build_dataset_and_split(npz_path, index_path, instrument_classes, data_perce
     random.seed(42)
     _, val_indices = train_test_split(
         range(len(dataset_instance)),
-        test_size=0.1,
+        test_size=0.05,
         random_state=42
     )
 
     print(f"Number of validation samples: {len(val_indices)}")
 
-    if len(val_indices) > 50:
+    if len(val_indices) > 10:
         random.seed(42)
-        val_indices = random.sample(val_indices, 50)
+        val_indices = random.sample(val_indices, 10)
         print(f"Reduced to 50 eval indices: {val_indices[:5]} …")
 
     return dataset_instance, val_indices, dataset_mode
@@ -110,9 +112,9 @@ def build_model_and_load_checkpoint(model_type, instrument_classes, gpt2_pretrai
             base_vocab_size=1024,
             max_length=3000,
             num_instruments=len(instrument_classes),
-            embed_dim=128,
-            num_layers=6,
-            num_heads=8,
+            embed_dim=768,
+            num_layers=12,
+            num_heads=24,
             dropout=0.1,
             device=device_obj,
             bos_token_id=1024 * 4,
@@ -207,139 +209,199 @@ def main(args):
         args.checkpoint_path,
         args.device
     )
+    print(model.codebook_count, 'here')
+    model.curriculum_stage = model.codebook_count   # enable **all** heads
+    model.to(device).eval()
 
     # 3) Prepare EnCodec / DataLoader
     processor     = AutoProcessor.from_pretrained("facebook/encodec_24khz")
     encodec_model = EncodecModel.from_pretrained("facebook/encodec_24khz").to(device)
 
-    data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0.0)
+    data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0.0, device=device)
     val_loader    = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
 
     # 4) Create both output dirs
     os.makedirs(args.pred_out_dir, exist_ok=True)  # e.g. E:/…_generated
     os.makedirs(args.gt_out_dir, exist_ok=True)    # e.g. E:/ground_truths
+    os.makedirs(args.vocal_save_path, exist_ok=True)
+
+    # sweep settings
+    top_p_values   = [0.97]
+    temperatures   = [1.0, 1.3]
 
     counter = 0
     for batch in val_loader:
+        base_name = f"val_{counter:05d}"
+        if dataset_mode in ("shared", "separate", "gpt2"):
+            flat_vc = batch["vocal_context"].squeeze(0).cpu()
+            vc_codes = deinterleave_flattening_shared(flat_vc, 4)
+            vc_codes = vc_codes % 1024
+            code_vocal = vc_codes.unsqueeze(0).to(device)
+        elif dataset_mode == "delay":
+            code_vocal = batch["vocal_context"].to(device)
+
+        # with torch.no_grad():
+        #     print(code_vocal.shape)
+        #     with autocast('cuda'):
+        #         wav_vocal = encodec_model.decode(code_vocal.unsqueeze(0), [None])[0]
+        #     wav_vocal = wav_vocal.cpu().float().squeeze().numpy()
+        # sf.write(
+        #     os.path.join(args.vocal_save_path, base_name + ".wav"),
+        #     wav_vocal,
+        #     samplerate=processor.sampling_rate
+        # )
         # ────────────── (A) DECODING THE PREDICTION ──────────────
-        if dataset_mode == "shared":
+        # if dataset_mode == "shared":
+        #     vc   = batch["vocal_context"].to(device)         # [1, T_flat]
+        #     itok = batch["instrument_token"].to(device)      # [1, T_flat]
+        #     pemb = batch["positional_embedding"].to(device)  # [1, T_flat, D]
+
+        #     with torch.no_grad():
+        #         flat_pred = model.generate(
+        #             vocal_context=vc,
+        #             instrument_token=itok,
+        #             positional_embedding=pemb,
+        #             max_length=model.max_length,
+        #             do_sample=False
+        #         )
+        #     flat_pred  = flat_pred.squeeze(0).cpu()                    # [T_flat]
+        #     pred_codes = deinterleave_flattening_shared(flat_pred, 4)  # [4, T_pred]
+        #     code_pred  = pred_codes.unsqueeze(0).to(device)            # [1,4,T_pred]
+
+        if dataset_mode == "separate":
             vc   = batch["vocal_context"].to(device)         # [1, T_flat]
             itok = batch["instrument_token"].to(device)      # [1, T_flat]
-            pemb = batch["positional_embedding"].to(device)  # [1, T_flat, D]
+            #pemb = batch["positional_embedding"].to(device)  # [1, T_flat, D]
 
-            with torch.no_grad():
-                flat_pred = model.generate(
-                    vocal_context=vc,
-                    instrument_token=itok,
-                    positional_embedding=pemb,
-                    max_length=model.max_length,
-                    do_sample=False
-                )
-            flat_pred  = flat_pred.squeeze(0).cpu()                    # [T_flat]
-            pred_codes = deinterleave_flattening_shared(flat_pred, 4)  # [4, T_pred]
-            code_pred  = pred_codes.unsqueeze(0).to(device)            # [1,4,T_pred]
+            top_p_values   = [0.70, 0.80, 0.85, 0.90, 0.95, 0.97]
+            temperatures   = [0.6, 0.7, 0.85, 1.0, 1.15, 1.3]
+            guidance_scales = args.guidance_scales           # e.g. [1.0,2.0,3.0]
 
-        elif dataset_mode == "separate":
-            vc   = batch["vocal_context"].to(device)         # [1, T_flat]
-            itok = batch["instrument_token"].to(device)      # [1, T_flat]
-            pemb = batch["positional_embedding"].to(device)  # [1, T_flat, D]
+            for p in top_p_values:
+                for T in temperatures:
+                    # for g in guidance_scales:
+                    p_i = int(p * 100)
+                    t_i = int(T * 100)
+                    # g_i = int(g * 100)
+                    # now nested: pXX_TYY/gZZ
+                    out_dir = os.path.join(
+                        args.pred_out_dir,
+                        f"p{p_i}_T{t_i}",
+                        # f"g{g_i}"
+                    )
+                    os.makedirs(out_dir, exist_ok=True)
 
-            with torch.no_grad():
-                flat_pred = model.generate(
-                    vocal_context=vc,
-                    instrument_token=itok,
-                    positional_embedding=pemb,
-                    max_length=model.max_length,
-                    do_sample=False
-                )
-            flat_cpu   = flat_pred.squeeze(0).cpu()                # [C * T_pred]
-            C          = 4
-            T_pred     = flat_cpu.numel() // C
-            mat        = torch.stack([flat_cpu[j::C] for j in range(C)], dim=0)  # [4, T_pred]
-            pred_codes = mat % 1024                                         # [4, T_pred]
-            code_pred  = pred_codes.unsqueeze(0).to(device)                 # [1,4,T_pred]
+                    with torch.no_grad():
+                        with autocast(device_type="cuda"):
+                            flat_pred = model.generate(
+                                vocal_context=vc,
+                                instrument_token=itok,
+                                #positional_embedding=pemb,
+                                max_length=model.max_length,
+                                top_p=p,
+                                temperature=T,
+                                do_sample=True
+                                # guidance_scale=g
+                            )
+                    # de‐interleave into codebooks
+                    flat_cpu = flat_pred.squeeze(0).cpu()       # [C * T_pred]
+                    C        = 4
+                    T_pred   = flat_cpu.numel() // C
+                    mat      = torch.stack([flat_cpu[j::C] for j in range(C)], dim=0)  # [4, T_pred]
+                    pred_codes = mat % 1024                                        # [4, T_pred]
+                    code_pred  = pred_codes.unsqueeze(0).to(device)                # [1,4,T_pred]
 
-        elif dataset_mode == "delay":
-            vc   = batch["vocal_context"].to(device)      # [1,4,S]
-            itok = batch["instrument_token"].to(device)   # [1,S]
-            pemb = batch["positional_embedding"].to(device)  # [1,S,D]
+                    # Decode to waveform
+                    with torch.no_grad():
+                        with autocast(device_type="cuda"):
+                            wav_pred = encodec_model.decode(code_pred.unsqueeze(0), [None])[0]
+                        wav_pred = wav_pred.cpu().float().squeeze().numpy()
 
-            with torch.no_grad():
-                seq_pred = model.generate(
-                    vocal_context=vc,
-                    instrument_token=itok,
-                    positional_embedding=pemb,
-                    max_length=model.max_length
-                )  # [1,4,S_pred]
+                    sf.write(
+                        os.path.join(out_dir, f"{base_name}.wav"),
+                        wav_pred,
+                        samplerate=processor.sampling_rate
+                    )
 
-            filtered    = batch["filtered_pattern"][0]
-            orig, _, mask = filtered.revert_pattern_sequence(seq_pred, special_token=1024)
-            valid       = mask.all(dim=0)       # [T_raw]
-            pred_codes  = orig[0,:,valid]       # [4, T_pred]
-            code_pred   = pred_codes.unsqueeze(0).to(device)  # [1,4,T_pred]
+                        # [1,4,T_pred]
 
-        else:  # “gpt2” mode
-            inp_ids  = batch["input_ids"].to(device)            # [1, T]
-            attn     = batch["attention_mask"].to(device)       # [1, T]
-            pemb     = batch["positional_embedding"].to(device) # [1, T, D]
-            itok     = batch["instrument_token"].to(device)     # [1, T]
+        # elif dataset_mode == "delay":
+        #     vc   = batch["vocal_context"].to(device)      # [1,4,S]
+        #     itok = batch["instrument_token"].to(device)   # [1,S]
+        #     pemb = batch["positional_embedding"].to(device)  # [1,S,D]
 
-            with torch.no_grad():
-                preds = model.generate(
-                    input_ids=inp_ids,
-                    attention_mask=attn,
-                    positional_embedding=pemb,
-                    instrument_token=itok,
-                    max_new_tokens=3000,
-                    do_sample=False,
-                    pad_token_id=model.config.eos_token_id
-                )  # [1, total_len]
+        #     with torch.no_grad():
+        #         seq_pred = model.generate(
+        #             vocal_context=vc,
+        #             instrument_token=itok,
+        #             positional_embedding=pemb,
+        #             max_length=model.max_length
+        #         )  # [1,4,S_pred]
 
-            flat        = preds.squeeze(0).cpu()[-3000:]                       # [3000]
-            pred_codes  = deinterleave_flattening_shared(flat, 4)              # [4, 750]
-            code_pred   = pred_codes.unsqueeze(0).to(device)                   # [1,4,750]
+        #     filtered    = batch["filtered_pattern"][0]
+        #     orig, _, mask = filtered.revert_pattern_sequence(seq_pred, special_token=1024)
+        #     valid       = mask.all(dim=0)       # [T_raw]
+        #     pred_codes  = orig[0,:,valid]       # [4, T_pred]
+        #     code_pred   = pred_codes.unsqueeze(0).to(device)  # [1,4,T_pred]
 
-        # Decode prediction → waveform
-        with torch.no_grad():
-            wav_pred = encodec_model.decode(code_pred.unsqueeze(0), [None])[0].cpu().squeeze().detach().numpy()
-        fname = f"val_{counter:05d}.wav"
-        sf.write(os.path.join(args.pred_out_dir, fname), wav_pred, samplerate=processor.sampling_rate)
+        # else:  # “gpt2” mode
+        #     inp_ids  = batch["input_ids"].to(device)            # [1, T]
+        #     attn     = batch["attention_mask"].to(device)       # [1, T]
+        #     pemb     = batch["positional_embedding"].to(device) # [1, T, D]
+        #     itok     = batch["instrument_token"].to(device)     # [1, T]
 
-        # ────────────── (B) DECODING THE GROUND-TRUTH ──────────────
-        # We need to extract that sample’s “true” encodec codes from the original NPZ.
-        if dataset_mode == "shared":
-            labels_flat = batch["labels"].squeeze(0).cpu()        # [T_flat_with_-100]
-            real_codes  = labels_flat[labels_flat != -100]       # [4*T_gt]
-            gt_codes    = deinterleave_flattening_shared(real_codes, 4)  # [4, T_gt]
-            code_gt     = gt_codes.unsqueeze(0).to(device)       # [1,4,T_gt]
+        #     with torch.no_grad():
+        #         preds = model.generate(
+        #             input_ids=inp_ids,
+        #             attention_mask=attn,
+        #             positional_embedding=pemb,
+        #             instrument_token=itok,
+        #             max_new_tokens=3000,
+        #             do_sample=False,
+        #             pad_token_id=model.config.eos_token_id
+        #         )  # [1, total_len]
 
-        elif dataset_mode == "separate":
-            labels_flat = batch["labels"].squeeze(0).cpu()        # [MAX_LENGTH]
-            real_codes  = labels_flat[labels_flat != -100]        # [4*T_gt]
-            C = 4
-            T_gt = real_codes.numel() // C
-            mat = torch.stack([real_codes[j::C] for j in range(C)], dim=0)  # [4, T_gt]
-            gt_codes = mat % 1024                                           # [4, T_gt]
-            code_gt  = gt_codes.unsqueeze(0).to(device)                     # [1,4,T_gt]
+        #     flat        = preds.squeeze(0).cpu()[-3000:]                       # [3000]
+        #     pred_codes  = deinterleave_flattening_shared(flat, 4)              # [4, 750]
+        #     code_pred   = pred_codes.unsqueeze(0).to(device)                   # [1,4,750]
 
-        elif dataset_mode == "delay":
-            seq_labels    = batch["labels"].unsqueeze(0).to(device)  # [1,4,S]
-            filtered      = batch["filtered_pattern"][0]
-            orig, _, mask = filtered.revert_pattern_sequence(seq_labels, special_token=1024)
-            valid         = mask.all(dim=0)       # [T_raw]
-            gt_codes      = orig[0,:,valid]       # [4, T_gt]
-            code_gt       = gt_codes.unsqueeze(0).to(device)  # [1,4,T_gt]
+        # # ────────────── (B) DECODING THE GROUND-TRUTH ──────────────
+        # # We need to extract that sample’s “true” encodec codes from the original NPZ.
+        # if dataset_mode == "shared":
+        #     labels_flat = batch["labels"].squeeze(0).cpu()        # [T_flat_with_-100]
+        #     real_codes  = labels_flat[labels_flat != -100]       # [4*T_gt]
+        #     gt_codes    = deinterleave_flattening_shared(real_codes, 4)  # [4, T_gt]
+        #     code_gt     = gt_codes.unsqueeze(0).to(device)       # [1,4,T_gt]
 
-        else:  # “gpt2” mode
-            labels_flat = batch["labels"].squeeze(0).cpu()     # [>3000]
-            flat_gt     = labels_flat[-3000:]                  # [3000 = 4*750]
-            gt_codes    = deinterleave_flattening_shared(flat_gt, 4)  # [4, 750]
-            code_gt     = gt_codes.unsqueeze(0).to(device)             # [1,4,750]
+        # if dataset_mode == "separate":
+        #     labels_flat = batch["labels"].squeeze(0).cpu()        # [MAX_LENGTH]
+        #     real_codes  = labels_flat[labels_flat != -100]        # [4*T_gt]
+        #     C = 4
+        #     T_gt = real_codes.numel() // C
+        #     mat = torch.stack([real_codes[j::C] for j in range(C)], dim=0)  # [4, T_gt]
+        #     gt_codes = mat % 1024                                           # [4, T_gt]
+        #     code_gt  = gt_codes.unsqueeze(0).to(device)                     # [1,4,T_gt]
+
+        # elif dataset_mode == "delay":
+        #     seq_labels    = batch["labels"].unsqueeze(0).to(device)  # [1,4,S]
+        #     filtered      = batch["filtered_pattern"][0]
+        #     orig, _, mask = filtered.revert_pattern_sequence(seq_labels, special_token=1024)
+        #     valid         = mask.all(dim=0)       # [T_raw]
+        #     gt_codes      = orig[0,:,valid]       # [4, T_gt]
+        #     code_gt       = gt_codes.unsqueeze(0).to(device)  # [1,4,T_gt]
+
+        # else:  # “gpt2” mode
+        #     labels_flat = batch["labels"].squeeze(0).cpu()     # [>3000]
+        #     flat_gt     = labels_flat[-3000:]                  # [3000 = 4*750]
+        #     gt_codes    = deinterleave_flattening_shared(flat_gt, 4)  # [4, 750]
+        #     code_gt     = gt_codes.unsqueeze(0).to(device)             # [1,4,750]
 
         # Decode ground-truth → waveform
-        with torch.no_grad():
-            wav_gt = encodec_model.decode(code_gt.unsqueeze(0), [None])[0].cpu().squeeze().detach().numpy()
-        sf.write(os.path.join(args.gt_out_dir, fname), wav_gt, samplerate=processor.sampling_rate)
+        # with torch.no_grad():
+        #     with autocast('cuda'):
+        #         wav_gt = encodec_model.decode(code_gt.unsqueeze(0), [None])[0]
+        #     wav_gt = wav_gt.cpu().float().squeeze().numpy()
+        # sf.write(os.path.join(args.gt_out_dir, f"{base_name}.wav"), wav_gt, samplerate=processor.sampling_rate)
 
         counter += 1
 
@@ -392,8 +454,20 @@ if __name__ == "__main__":
         help="Where to write ground-truth WAVs (e.g. E:/ground_truths)"
     )
     parser.add_argument(
+        "--vocal_save_path", type=str, required=True, 
+        help="Where to write the decoded *vocal* WAVs"
+    )
+    parser.add_argument(
         "--device", type=str, default="cuda",
         help="‘cuda’ or ‘cpu’"
     )
+    parser.add_argument("--guidance_scales", nargs="+", type=float,
+                   default=[1.0, 2.0, 3.0],
+                   help="List of guidance scales (e.g. 1.0 2.0 3.0)")
     args = parser.parse_args()
     main(args)
+
+
+
+
+#compute F SCORE for beat alignment

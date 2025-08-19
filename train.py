@@ -5,7 +5,7 @@ import torch
 import random
 import numpy as np
 from torch.utils.data import Dataset
-from transformers import Trainer, TrainingArguments
+from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 import wandb
@@ -13,6 +13,8 @@ from collections import defaultdict
 import argparse
 from utils.embeddings_4_bands import convert_4_to_2_band
 from utils.patterns import StackDelayPatternProvider, DelayedPatternProvider
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingWarmRestarts
 
 print(torch.__version__)          # e.g. “1.15.1+cu118”
 print(torch.version.cuda)         # e.g. “11.8”
@@ -28,6 +30,7 @@ BOS_TOKEN_ID_SHARED     = AUDIO_VOCAB_SIZE_SHARED  # 1024
 TOKEN_VOCAB_SIZE_SHARED = AUDIO_VOCAB_SIZE_SHARED + 1  # +1 for BOS
 
 # For flattening_separate:
+
 BASE_AUDIO_VOCAB_SIZE   = 1024
 TOTAL_AUDIO_VOCAB_SIZE  = BASE_AUDIO_VOCAB_SIZE * 4  # e.g. 4 codebooks per frame
 BOS_SEP                = TOTAL_AUDIO_VOCAB_SIZE
@@ -175,6 +178,12 @@ class MusicDataset(Dataset):
             track_codes = sample_dict["generation_data"][subsample_id][track_class]["encodec"]  # (C_t, T)
             pos_emb = sample_dict["positional_embedding"][subsample_id]                        # (T, D)
 
+            # Only keep the first K codebooks:
+            K = 4
+            vocal_codes = vocal_codes[:K, :]    # now shape = (K, T)
+            track_codes = track_codes[:K, :]    # now shape = (K, T)
+            #vocal_codes = vocal_codes.squeeze(0)
+
             C_t, T = track_codes.shape
             C_v, _ = vocal_codes.shape
 
@@ -261,11 +270,12 @@ class MusicDataset(Dataset):
 
 # ──────────────────────────────────────────────────────────────────────────────
 class DataCollatorWithPositionalEmbeddings:
-    def __init__(self, mode: str = "shared", cond_drop_prob: float = 0, *, kmeans=None, token_embedding=None):
+    def __init__(self, mode: str = "shared", cond_drop_prob: float = 0, *, kmeans=None, token_embedding=None, device: torch.device,):
         self.mode = mode
         self.cond_drop_prob = cond_drop_prob
         self.kmeans = kmeans
         self.token_embedding = token_embedding
+        self.device = device
 
     def __call__(self, batch):
         global device
@@ -298,23 +308,27 @@ class DataCollatorWithPositionalEmbeddings:
             }
 
         elif self.mode == "separate":
-            vocal = torch.stack([b["input_ids"]            for b in batch]).to(device)
-            #inst = torch.stack([b["instrument_token"]     for b in batch]).to(device)
-            #pos_emb = torch.stack([b["positional_embedding"] for b in batch]).to(device)
-            labels = torch.stack([b["labels"]               for b in batch]).to(device)
+            vocal = torch.stack([b["input_ids"]            for b in batch]).to(self.device)
+            inst = torch.stack([b["instrument_token"]     for b in batch]).to(self.device)
+            #pos_emb = torch.stack([b["positional_embedding"] for b in batch]).to(self.device)
+            labels = torch.stack([b["labels"]               for b in batch]).to(self.device)
 
             B, T = labels.shape
-            start_token = torch.full((B, 1), BOS_SEP, dtype=torch.long, device=device)
-            target_input_ids = torch.cat([start_token, labels[:, :-1]], dim=1)
 
-            if random.random() < 0.10:
-                vocal[:] = 4096
+            K = 4
+            dynamic_bos = BASE_AUDIO_VOCAB_SIZE * K
+            pad_id = dynamic_bos + 1
+            start_token = torch.full((B, 1), dynamic_bos, dtype=torch.long, device=self.device)
+            target_input_ids = torch.cat([start_token, labels[:, :-1]], dim=1)
+            if self.cond_drop_prob > 0:
+                drop_mask = torch.rand(B, device=self.device) < self.cond_drop_prob
+                vocal[drop_mask, :] = pad_id
 
             return {
                 "input_ids":            target_input_ids,
                 "vocal_context":        vocal,
-                # "instrument_token":     inst,
-                # "positional_embedding": pos_emb,
+                "instrument_token":     inst,
+                #"positional_embedding": pos_emb,
                 "labels":               labels,
             }
 
@@ -348,6 +362,19 @@ if __name__ == "__main__":
         torch.backends.cuda.allow_tf32 = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    import os
+    import torch.distributed as dist
+
+    if not dist.is_initialized():
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "12355"
+        # world_size=1, rank=0 for a single‑GPU/process job
+        dist.init_process_group(
+            backend="gloo",
+            init_method="env://",
+            world_size=1,
+            rank=0,
+        )
     print("Using device:", device)
     if torch.cuda.is_available():
         print("Number of GPUs:", torch.cuda.device_count())
@@ -380,6 +407,7 @@ if __name__ == "__main__":
         help="(For model_type 'gpt2') If set, load pretrained GPT-2 weights; else initialize from config"
     )
     parser.add_argument("--num_train_epochs", type=int, default=5, help="Number of training epochs")
+
     args = parser.parse_args()
 
     # -------------------------------
@@ -402,8 +430,14 @@ if __name__ == "__main__":
     # -------------------------------
     # Load Data using NPZ loader (shared for all models)
     # -------------------------------
-    NPZ_PATH   = "E:/aggregated_output.npz"
+    NPZ_PATH   = "E:/aggregated_output_with_noise.npz"
     INDEX_PATH = "./big_dataset_index.json"
+
+    print("NPZ_PATH:", NPZ_PATH)
+    print("Exists?", os.path.exists(NPZ_PATH))
+
+    f = np.load(NPZ_PATH, allow_pickle=True)
+    print(f.files[:20], "… (total", len(f.files), "keys )")
     data = load_npz_with_index(
         NPZ_PATH,
         INDEX_PATH,
@@ -411,20 +445,45 @@ if __name__ == "__main__":
         data_percent=args.data_percent
     )
 
-    print("\n✅ Data loaded (all sample IDs).")
 
-    first_sample = next(iter(data.values()))
-    any_sub = next(iter(first_sample["generation_data"].values()))
+    # 1) How many “roots” (i.e. songs) did we load?
+    print(f"Loaded {len(data)} roots")
+
+    # 2) For each root, how many subsamples?
+    for root, root_data in data.items():
+        n_subs = len(root_data["generation_data"])
+        print(f"  – {root!r}: {n_subs} segments")
+
+    # 3) What tracks exist in the first segment of the first root?
+    first_root = next(iter(data))
+    first_sub  = next(iter(data[first_root]["generation_data"]))
+    print("Tracks in", first_root, first_sub, ":", 
+        list(data[first_root]["generation_data"][first_sub].keys()))
+
+    # 4) Count per‐track how many segments we have
+    from collections import Counter
+    ctr = Counter()
+    for root_data in data.values():
+        for seg in root_data["generation_data"].values():
+            for track in seg.keys():
+                ctr[track] += 1
+    print("Segment counts by track:")
+    for track, count in ctr.items():
+        print(f"  {track:20s}: {count}")
+
+
+    print("\n✅ Data loaded (all sample IDs).")
 
     # -------------------------------
     # Constants and Configurations
     # -------------------------------
-    if args.model_type == "delay":
-        T_RAW = 750                 # audio frames you really want
+    T_RAW = 750 
+    if args.model_type == "delay":                # audio frames you really want
         N_DELAY = 3                 # one per codebook
         MAX_LENGTH = T_RAW + N_DELAY  # 753
     else:
-        MAX_LENGTH = 3000
+        K = 4
+        MAX_LENGTH = T_RAW * K
 
     instrument_token_map = {k: full_token_map[k] for k in track_classes}
     VOCAB_SIZE = max(instrument_token_map.values()) + 1  # For flattening_shared & GPT-2
@@ -448,6 +507,8 @@ if __name__ == "__main__":
     wandb.init(
         project="music-generation",
         name=wandb_run_name,
+        #id="f9xha87j",
+        #resume="allow",
         config={
             "data_percent": args.data_percent,
             "instrument_classes": track_classes,
@@ -477,7 +538,7 @@ if __name__ == "__main__":
         dataset_mode = "shared"
         current_vocab_size = AUDIO_VOCAB_SIZE_SHARED
 
-    data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0.1)
+    data_collator = DataCollatorWithPositionalEmbeddings(mode=dataset_mode, cond_drop_prob=0, device=device)
 
     # -------------------------------
     # Initialize the Model Based on --model_type
@@ -497,14 +558,15 @@ if __name__ == "__main__":
             base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
             max_length=MAX_LENGTH,
             num_instruments=num_instruments,
-            embed_dim=128,
-            num_layers=6,
-            num_heads=8,
+            embed_dim=768,
+            num_layers=12,
+            num_heads=24,
             dropout=0.1,
             device=device,
             bos_token_id=BOS_SEP,
         )
     elif args.model_type == "flattening_separate_multiple_heads":
+        K = 4
         model = init_flattening_separate_multiple_heads_model(
             base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
             max_length=MAX_LENGTH,
@@ -515,6 +577,7 @@ if __name__ == "__main__":
             dropout=0.1,
             device=device,
             bos_token_id=BOS_SEP,
+            codebook_count=K
         )
     elif args.model_type == "flattening_separate_curriculum":
         model = CurriculumFlatteningSeparateLM(
@@ -523,9 +586,10 @@ if __name__ == "__main__":
             embed_dim=128,
             num_layers=6,
             num_heads=8,
-            dropout=0,
+            dropout=0.1,
             base_vocab_size=BASE_AUDIO_VOCAB_SIZE,
             bos_token_id=BOS_SEP,
+            codebook_count=K
         )
     elif args.model_type == "delay":
         model = init_delay_model(
@@ -554,9 +618,15 @@ if __name__ == "__main__":
     # -------------------------------
     # Build Dataset and Split
     # -------------------------------
+    sample_ids = list(data.keys())[:16]
+    filtered_data = {k: data[k] for k in sample_ids}
     dataset_instance = MusicDataset(data, instrument_token_map, mode=dataset_mode)
     if len(dataset_instance) == 0:
         raise ValueError("No valid samples found for your track classes.")
+    
+    print(f"🎵 Number of songs selected: {len(sample_ids)}")
+    print(f"📀 Total training samples (segments): {len(dataset_instance)}")
+
 
     random.seed(42)
     all_indices = list(range(len(dataset_instance)))
@@ -564,7 +634,7 @@ if __name__ == "__main__":
     overfit_subset = torch.utils.data.Subset(dataset_instance, small_indices)
     print(f"🔍 Overfit subset length = {len(overfit_subset)} (should be 32)")
 
-    train_indices, val_indices = train_test_split(range(len(dataset_instance)), test_size=0.1, random_state=42)
+    train_indices, val_indices = train_test_split(range(len(dataset_instance)), test_size=0.05, random_state=42)
     print(f"Number of validation samples: {len(val_indices)}")
     train_dataset = torch.utils.data.Subset(dataset_instance, train_indices)
     val_dataset   = torch.utils.data.Subset(dataset_instance, val_indices)
@@ -576,18 +646,21 @@ if __name__ == "__main__":
     # Training Arguments & Dynamic Eval Setup (Unified)
     # -------------------------------
     training_args = TrainingArguments(
-        output_dir="E:/results_delay",
+        output_dir="E:/results_big_head_1024_lr_scheduler_cosine_2e-4_no_beat_embedding",
         eval_strategy="steps",
+        eval_steps=10000,
         save_strategy="steps",   # Save strategy will match evaluation
-        learning_rate=1e-5,
+        save_steps=10000,
+        warmup_steps=1000,
+        learning_rate=2e-4, #5e-4 #8e-4
         lr_scheduler_type="cosine",
-        per_device_train_batch_size=6,
-        per_device_eval_batch_size=6,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=5,
         num_train_epochs=args.num_train_epochs,
-        weight_decay=1e-4,
+        weight_decay=0.01,
         save_total_limit=3,
-        logging_dir="./logs",
-        logging_steps=1,
+        logging_dir="./logs_no_beat_embedding",
+        logging_steps=100,
         load_best_model_at_end=True,
         metric_for_best_model="loss",
         greater_is_better=False,
@@ -598,13 +671,10 @@ if __name__ == "__main__":
         save_safetensors=False,
         remove_unused_columns=False,
         max_grad_norm=1.0,
-        gradient_accumulation_steps=2
+        max_steps=200000
     )
 
     total_train_steps = (len(overfit_subset) // training_args.per_device_train_batch_size) * training_args.num_train_epochs
-    training_args.warmup_steps = 1000
-    training_args.eval_steps = 5000
-    training_args.save_steps = 5000
     print(f"Total training steps: {total_train_steps}")
     print(f"Logging 5 audio samples per evaluation.")
     print(f"Evaluating and saving every 5000 steps.")
@@ -614,21 +684,43 @@ if __name__ == "__main__":
     # -------------------------------
     callbacks = [
         LrLoggerCallback(),
-        EvalAudioLoggerCallback(device=device, model_type=args.model_type, codebook_count=4, codebook_length=750),
+        EvalAudioLoggerCallback(device=device, model_type=args.model_type, codebook_count= 4, codebook_length=750),
     ]
 
     if args.model_type == "flattening_separate_curriculum":
-        schedule_map = {0: 1, 60000: 2, 120000: 3, 180000: 4}
+        schedule_map = {0: 1, 96000: 2, 400000: 3, 528000: 4}
         callbacks.append(CurriculumScheduler(schedule_map))
 
+
+    # ── Load just the model weights from checkpoint (skip resume)
+    # state_dict = torch.load("E:/results_codebook0/phaseJ/checkpoint-80000/pytorch_model.bin")
+    # model.load_state_dict(state_dict, strict=True)
+
+    # optimizer = AdamW(model.parameters(), lr=1e-5, weight_decay=0.01)
+
+    # scheduler = ReduceLROnPlateau(
+    #     optimizer,
+    #     mode="min",
+    #     factor=0.7,        # cut LR in half
+    #     patience=1,        # wait only one eval
+    #     threshold=6e-4,    # require a 0.01% improvement
+    #     threshold_mode="rel",        # no cooldown period
+    #     min_lr=1e-7
+    # )
+
+    # 5) Pass it into Trainer, leaving the scheduler as None so that
+    #    HF Trainer will build your cosine scheduler from `TrainingArguments`:
     trainer = Trainer(
         model=model,
         args=training_args,
+        # optimizers=(optimizer, None),
         data_collator=data_collator,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         callbacks=callbacks,
     )
+
+
 
     # ──────────────────────────────────────────────────────────────────────────
     # DROP-IN: 1-STEP GRADIENT CHECK
@@ -645,8 +737,33 @@ if __name__ == "__main__":
 
     # -------------------------------
     # Train and Save
-    # -------------------------------
+    # ------------------------------
+
+    # state_dict = torch.load("E:/results_big_head_1024_lr_scheduler/checkpoint-130000/pytorch_model.bin")
+    # model.load_state_dict(state_dict, strict=True)
+
+    #trainer.train(resume_from_checkpoint="E:/results_big_head_1024_lr_scheduler_cosine_2e-4_cfg/checkpoint-180000")
+
     trainer.train()
+    #trainer.model.curriculum_stage = 4
+    # from transformers import TrainerCallback
+    # class LrResetCallback(TrainerCallback):
+    #     def on_train_begin(self, args, state, control, **kwargs):
+    #         # kwargs contains 'optimizer' and 'lr_scheduler'
+    #         optim    = kwargs["optimizer"]
+    #         sched    = kwargs["lr_scheduler"]
+    #         new_lr   = 1e-5
+    #         # 1) reset optimizer param groups
+    #         for pg in optim.param_groups:
+    #             pg["lr"] = new_lr
+    #         # 2) reset scheduler base_lrs (so future steps don't jump back)
+    #         sched.base_lrs[:] = [new_lr] * len(sched.base_lrs)
+    #         print(f"→ learning rate overridden to {new_lr}")
+
+    # # …after you instantiate trainer…
+    # trainer.add_callback(LrResetCallback())
+    # trainer.train(resume_from_checkpoint="E:/results_big_head_1024_lr_scheduler/checkpoint-200000")
+
     metrics = trainer.evaluate()
     print("Final eval on best checkpoint:", metrics)
     model_save_path = f"./saved_model_{wandb_run_name}"

@@ -64,7 +64,8 @@ def init_flattening_separate_multiple_heads_model(
     num_heads=8,
     dropout=0.1,
     device="cpu",
-    bos_token_id=None     # ← new
+    bos_token_id=None,     # ← new
+    codebook_count=4
 ):
     # codebook_count defaults to 4 in the model, and total_vocab_size will be base_vocab_size * codebook_count
     model = CustomFlatteningSeparateLMHEADS(
@@ -75,7 +76,8 @@ def init_flattening_separate_multiple_heads_model(
         num_layers=num_layers,
         num_heads=num_heads,
         dropout=dropout,
-        bos_token_id=bos_token_id
+        bos_token_id=bos_token_id,
+        codebook_count=codebook_count
     ).to(device)
     return model
 

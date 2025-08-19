@@ -27,6 +27,11 @@ def load_npz_with_index(npz_path, index_path, track_classes, data_percent=100):
             key_voc = f"{gen_base}/vocals/encodec"
             if key_voc in archive:
                 nested[root]["generation_data"][subs]["vocals"]["encodec"] = archive[key_voc]
+            
+            # 2) noisy vocals
+            key_vn = f"{gen_base}/vocals_with_noise/encodec"
+            if key_vn in archive:
+                nested[root]["generation_data"][subs]["vocals_with_noise"]["encodec"] = archive[key_vn]
 
             # load your requested tracks
             for track in track_classes:

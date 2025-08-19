@@ -15,7 +15,7 @@ import numpy as np
 from torch.utils.data import Subset
 from utils.models_flattening import CustomFlatteningSharedTransformerLM
 
-
+from transformers import TrainerCallback
 
 BASE_AUDIO_VOCAB_SIZE = 1024
 tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
@@ -80,35 +80,40 @@ class EvalAudioLoggerCallback(TrainerCallback):
         with torch.no_grad():
             if isinstance(model, (CustomFlatteningSeparateCodebookBigLMHead, CustomFlatteningSeparateLMHEADS,  CurriculumFlatteningSeparateLM)):
                 vocal_context        = batch["vocal_context"].to(self.device)
-                # instrument_token     = batch["instrument_token"].to(self.device)
-                # positional_embedding = batch["positional_embedding"].to(self.device)
+                instrument_token     = batch["instrument_token"].to(self.device)
+                #positional_embedding = batch["positional_embedding"].to(self.device)
 
                 # Generate autoregressively up to full length:
                 max_len = model.max_length  # e.g. 3000
-                preds = model.generate(
-                    vocal_context=vocal_context,
-                    #instrument_token=instrument_token,
-                    # positional_embedding=positional_embedding,
-                    max_length=max_len,
-                    do_sample=False,
-                ).to(self.device)   # [B, max_len]
-                C = self.codebook_count
-                preds_top_k = model.generate(
-                    vocal_context=vocal_context,
-                    # instrument_token=instrument_token,
-                    # positional_embedding=positional_embedding,
-                    max_length=model.max_length,
-                    do_sample=True,
-                    top_k=50,
-                    temperature=0.8
-                ).to(self.device)
+                # preds = model.generate(
+                #     vocal_context=vocal_context,
+                #     instrument_token=instrument_token,
+                #     positional_embedding=positional_embedding,
+                #     max_length=max_len,
+                #     do_sample=False,
+                # ).to(self.device)   # [B, max_len]
+                # C = self.codebook_count
+                # preds_top_k = model.generate(
+                #     vocal_context=vocal_context,
+                #     instrument_token=instrument_token,
+                #     positional_embedding=positional_embedding,
+                #     max_length=model.max_length,
+                #     do_sample=True,
+                #     top_k=250,
+                #     temperature=0.8
+                # ).to(self.device)
+
+
                 preds_nucleus = model.generate(
                     vocal_context=vocal_context,
+                    instrument_token=instrument_token,
+                    #positional_embedding=positional_embedding,
                     max_length=model.max_length,
+                    #guidance_scale=3.0,
                     do_sample=True,
                     top_k=None,       # either omit or explicitly set to None
                     top_p=0.90,       # <-- this turns on nucleus sampling
-                    temperature=0.8
+                    temperature=1.0
                 ).to(self.device)
             elif isinstance(model, CustomGPT2ForConditionalGeneration):
                 preds = model.generate(
@@ -213,25 +218,25 @@ class EvalAudioLoggerCallback(TrainerCallback):
         for i in range(min(self.samples_to_log, batch_size)):
             # --- predicted audio ---
             if isinstance(model, (CustomFlatteningSeparateCodebookBigLMHead, CustomFlatteningSeparateLMHEADS, CurriculumFlatteningSeparateLM)):
-                flat_preds = preds[i].cpu()  # shape: (C * L,)
+                # flat_preds = preds[i].cpu()  # shape: (C * L,)
                 C = self.codebook_count
                 L = self.codebook_length
-                pred_seq = torch.stack([ flat_preds[j::C] for j in range(C) ], dim=0)
-                pred_seq = pred_seq % BASE_AUDIO_VOCAB_SIZE
+                # pred_seq = torch.stack([ flat_preds[j::C] for j in range(C) ], dim=0)
+                # pred_seq = pred_seq % BASE_AUDIO_VOCAB_SIZE
 
-                flat_preds_top_k = preds_top_k[i].cpu()  # shape: (C * L,)
-                pred_seq_top_k = torch.stack([ flat_preds_top_k[j::C] for j in range(C) ], dim=0)
-                pred_seq_top_k = pred_seq_top_k % BASE_AUDIO_VOCAB_SIZE
-                print(pred_seq.shape, pred_seq_top_k.shape, 'eta herum')
-                codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
-                audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
-                .cpu().squeeze().detach().numpy()
-                wandb.log({
-                    f"pred_top_k/sample_{i}": wandb.Audio(
-                        audio_pred_top_k,
-                        sample_rate=self.processor.sampling_rate,
-                        caption=f"Pred Top K #{i}"
-                    ), "step": state.global_step})
+                # flat_preds_top_k = preds_top_k[i].cpu()  # shape: (C * L,)
+                # pred_seq_top_k = torch.stack([ flat_preds_top_k[j::C] for j in range(C) ], dim=0)
+                # pred_seq_top_k = pred_seq_top_k % BASE_AUDIO_VOCAB_SIZE
+                # print(pred_seq.shape, pred_seq_top_k.shape, 'eta herum')
+                # codes_pred_top_k = pred_seq_top_k.unsqueeze(0).unsqueeze(0).to(self.device)
+                # audio_pred_top_k = self.model_encodec.decode(codes_pred_top_k, [None])[0] \
+                # .cpu().squeeze().detach().numpy()
+                # wandb.log({
+                #     f"pred_top_k/sample_{i}": wandb.Audio(
+                #         audio_pred_top_k,
+                #         sample_rate=self.processor.sampling_rate,
+                #         caption=f"Pred Top K #{i}"
+                #     ), "step": state.global_step})
 
                 flat_preds_nucleus = preds_nucleus[i].cpu()  # shape: (C * L,)
                 pred_seq_nucleus = torch.stack([ flat_preds_nucleus[j::C] for j in range(C) ], dim=0)
@@ -243,7 +248,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     f"pred_nucleus/sample_{i}": wandb.Audio(
                         audio_pred_nucleus,
                         sample_rate=self.processor.sampling_rate,
-                        caption=f"Pred Top K #{i}"
+                        caption=f"Pred Top P #{i}"
                     ), "step": state.global_step})
             elif isinstance(model, RVQDelayTransformerLM):
                 filtered = batch["filtered_pattern"][i]
@@ -294,26 +299,21 @@ class EvalAudioLoggerCallback(TrainerCallback):
                     ), "step": state.global_step})
 
 
-            codes_pred = pred_seq.unsqueeze(0).unsqueeze(0).to(self.device)
+            # codes_pred = pred_seq.unsqueeze(0).unsqueeze(0).to(self.device)
 
-            min_code = int(codes_pred.min().item())
-            max_code = int(codes_pred.max().item())
-            print(f"Predicted code range: {min_code} to {max_code}")
-            print("Unique predicted codes:", torch.unique(codes_pred))
+            # min_code = int(codes_pred.min().item())
+            # max_code = int(codes_pred.max().item())
+            # print(f"Predicted code range: {min_code} to {max_code}")
+            # print("Unique predicted codes:", torch.unique(codes_pred))
 
-            audio_pred = self.model_encodec.decode(codes_pred, [None])[0] \
-                .cpu().squeeze().detach().numpy()
+            # audio_pred = self.model_encodec.decode(codes_pred, [None])[0] \
+            #     .cpu().squeeze().detach().numpy()
 
             # log raw pred + spectrogram
             wandb.log({
-                f"pred_audio/sample_{i}": wandb.Audio(
-                    audio_pred,
-                    sample_rate=self.processor.sampling_rate,
-                    caption=f"Predicted audio Greedy {i}"
-                ),
                 f"pred_spectrogram/sample_{i}": wandb.Image(
                     plot_spectrogram(
-                        audio_pred,
+                        audio_pred_nucleus,
                         self.processor.sampling_rate,
                         title=f"Pred Spectrogram {i}",
                         n_fft=1024,       # <— pick something ≥ 2*(n_mels-1)
@@ -345,7 +345,7 @@ class EvalAudioLoggerCallback(TrainerCallback):
                 .cpu().squeeze().detach().numpy()
 
             # log mixed
-            audio_mix = audio_pred + audio_vocal
+            audio_mix = audio_pred_nucleus + audio_vocal
             wandb.log({
                 f"mixed_audio/sample_{i}": wandb.Audio(
                     audio_mix,

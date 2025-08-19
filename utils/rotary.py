@@ -53,7 +53,15 @@ class RotaryEmbedding(nn.Module):
 
     def get_embedding(self, seq_len, device, seq_start=0):
         # generate frequencies for positions [seq_start .. seq_start+seq_len-1]
+        if seq_len <= 0:
+            raise ValueError(f"[RoPE] Invalid sequence length: {seq_len} (seq_start={seq_start})")
         t = torch.arange(seq_start, seq_start + seq_len, device=device).type_as(self.inv_freq)
+
+        if t.numel() == 0:
+            raise ValueError(f"[RoPE] Time indices are empty. seq_start={seq_start}, seq_len={seq_len}")
+        max_pos = t[-1].item()
+        if max_pos > 2999:
+            print(f"⚠️ RoPE EXTRAPOLATION: seq_start={seq_start}, max_pos={max_pos}")
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb
@@ -61,6 +69,7 @@ class RotaryEmbedding(nn.Module):
     def rotate_queries_or_keys(self, x, seq_start=0):
         # x: [B, h, T, dim_head]
         seq_len = x.shape[-2]
+        assert seq_len > 0, f"Invalid seq_len={seq_len} for rotary input: x.shape={x.shape}, seq_start={seq_start}"
         freqs = self.get_embedding(seq_len, x.device, seq_start)
         return apply_rotary_pos_emb(x, freqs.unsqueeze(0).unsqueeze(0))
 
@@ -71,14 +80,14 @@ class Attend(nn.Module):
         self.dropout = dropout
         self.scale = scale
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, is_causal):
         if exists(self.scale):
             default_scale = q.shape[-1] ** -0.5
             q = q * (self.scale / default_scale)
         return F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True
+            is_causal=is_causal
         )
 
 class Attention(nn.Module):
@@ -135,7 +144,7 @@ class Attention(nn.Module):
                 v = v[:, :, -self.max_kv_len:, :]
 
         # scaled dot-product attention
-        out = self.attend(q, k, v)
+        out = self.attend(q, k, v, is_causal = not use_cache)
         # gating
         if exists(self.to_gates):
             gates = self.to_gates(x_norm)
